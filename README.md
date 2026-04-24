@@ -1,4 +1,4 @@
-# 🎧 Qwen Audiobook Converter with CUDA graph optimization for speedup 
+# 🎧 Qwen Audiobook Converter with CUDA Graph Optimization for Speedup 
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
