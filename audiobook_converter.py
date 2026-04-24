@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Qwen-Based Audiobook Converter
-Converts PDFs, EPUBs, DOCX, DOC, TXT files into audiobooks using Qwen Voice API
+Converts PDFs, EPUBs, DOCX, DOC, TXT files into audiobooks using faster-qwen3-tts
 
-Author: Rewritten for Qwen Voice Model
-License: MIT
+Uses faster-qwen3-tts with CUDA graph optimization for 5-10x speedup vs baseline.
+Requires: NVIDIA GPU with CUDA, PyTorch >= 2.5.1
 """
 
 import os
@@ -22,12 +22,20 @@ import xml.etree.ElementTree as ET
 from html import unescape
 import re
 from datetime import datetime
+
+# faster-qwen3-tts imports
+import numpy as np
+import torch
+from faster_qwen3_tts import FasterQwen3TTS
+
+# Audio processing
+from pydub import AudioSegment
+from pydub.exceptions import CouldntDecodeError
+
+# Format-specific imports (loaded on demand)
 import PyPDF2
 import ebooklib
 from ebooklib import epub
-from pydub import AudioSegment
-from pydub.exceptions import CouldntDecodeError
-from gradio_client import Client, handle_file
 
 # Fix Windows console encoding for emoji/unicode
 if sys.platform == 'win32':
@@ -35,46 +43,75 @@ if sys.platform == 'win32':
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stderr.reconfigure(encoding='utf-8')
     except AttributeError:
-        # Python < 3.7
         import codecs
         sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
         sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 # =============================================================================
-# HARDCODED CONFIGURATION
+# LOAD CONFIG FROM config.py (with fallback defaults)
 # =============================================================================
 
-# Qwen API Configuration
-QWEN_API_URL = "http://127.0.0.1:7860"
-API_TIMEOUT = 300
+try:
+    import config as user_config
+except ImportError:
+    user_config = None
+
+
+def _cfg(attr, default):
+    """Get a config value from config.py, falling back to default if not found."""
+    if user_config is not None and hasattr(user_config, attr):
+        return getattr(user_config, attr)
+    return default
+
+
+# =============================================================================
+# HARDCODED CONFIGURATION (defaults used when config.py is missing)
+# =============================================================================
+
 MAX_RETRIES = 3
 
-# Hardcoded Voice Settings (Always use 1.7B model)
-CUSTOM_VOICE_SPEAKER = "Ryan"
-CUSTOM_VOICE_LANGUAGE = "English"
-CUSTOM_VOICE_INSTRUCT = "Speak naturally and clearly, as if reading a dramatic book to an adult audience."
-CUSTOM_VOICE_MODEL_SIZE = "1.7B"  # Always use 1.7B
-CUSTOM_VOICE_SEED = -1
+# faster-qwen3-tts Model Configuration
 CUSTOM_VOICE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+VOICE_CLONE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEVICE = _cfg("FASTER_QWEN_DEVICE", "cuda")
+DTYPE = torch.bfloat16 if _cfg("FASTER_QWEN_DTYPE", "bfloat16") == "bfloat16" else torch.float16
 
-# Voice Clone Settings (Always use 1.7B model)
-VOICE_CLONE_LANGUAGE = "English"
-VOICE_CLONE_USE_XVECTOR_ONLY = False
-VOICE_CLONE_MODEL_SIZE = "1.7B"  # Always use 1.7B
-VOICE_CLONE_MAX_CHUNK_CHARS = 200
-VOICE_CLONE_CHUNK_GAP = 0
-VOICE_CLONE_SEED = -1
+# Hardcoded Voice Settings (CustomVoice mode)
+CUSTOM_VOICE_SPEAKER = _cfg("CUSTOM_VOICE_SPEAKER", "Ryan")
+CUSTOM_VOICE_LANGUAGE = _cfg("CUSTOM_VOICE_LANGUAGE", "English")
+CUSTOM_VOICE_INSTRUCT = _cfg("CUSTOM_VOICE_INSTRUCT", "Speak naturally and clearly, as if reading a dramatic book to an adult audience.")
+CUSTOM_VOICE_SEED = _cfg("CUSTOM_VOICE_SEED", -1)
 
-# Processing Settings
-BOOKS_FOLDER = "book_to_convert"  # Input folder
-AUDIOBOOKS_FOLDER = "audiobooks"  # Output folder
-CHUNK_SIZE_WORDS = 1500  # Increased to reduce number of chunks and speed up processing
-MAX_WORKERS = 1  # Keep at 1 to avoid rate limiting
-AUDIO_FORMAT = "mp3"
-AUDIO_BITRATE = "128k"
-MIN_DELAY_BETWEEN_CHUNKS = 1  # Reduced delay
+# Voice Clone Settings (loaded from config.py with fallbacks)
+VOICE_CLONE_LANGUAGE = _cfg("VOICE_CLONE_LANGUAGE", "Auto")
+VOICE_CLONE_USE_XVECTOR_ONLY = _cfg("VOICE_CLONE_USE_XVECTOR_ONLY", False)
+VOICE_CLONE_MAX_CHUNK_CHARS = _cfg("VOICE_CLONE_MAX_CHUNK_CHARS", 200)
+VOICE_CLONE_CHUNK_GAP = _cfg("VOICE_CLONE_CHUNK_GAP", 0)
+VOICE_CLONE_SEED = _cfg("VOICE_CLONE_SEED", -1)
+VOICE_CLONE_APPEND_SILENCE = _cfg("VOICE_CLONE_APPEND_SILENCE", True)
 
-# Optional imports with fallbacks
+# Voice Design Settings
+VOICE_DESIGN_LANGUAGE = _cfg("VOICE_DESIGN_LANGUAGE", "Auto")
+VOICE_DESIGN_DESCRIPTION = _cfg("VOICE_DESIGN_DESCRIPTION", "Speak in a clear, professional narrator voice suitable for reading audiobooks.")
+VOICE_DESIGN_SEED = _cfg("VOICE_DESIGN_SEED", -1)
+
+# Processing Settings (loaded from config.py with fallbacks)
+BOOKS_FOLDER = _cfg("BOOKS_FOLDER", "book_to_convert")
+AUDIOBOOKS_FOLDER = _cfg("AUDIOBOOKS_FOLDER", "audiobooks")
+CHUNK_SIZE_WORDS = _cfg("CHUNK_SIZE_WORDS", 1000)
+MAX_WORKERS = _cfg("MAX_WORKERS", 1)
+AUDIO_FORMAT = _cfg("AUDIO_FORMAT", "mp3")
+AUDIO_BITRATE = _cfg("AUDIO_BITRATE", "128k")
+MIN_DELAY_BETWEEN_CHUNKS = _cfg("MIN_DELAY_BETWEEN_CHUNKS", 0.5)
+
+# Streaming settings for faster generation (loaded from config.py with fallbacks)
+STREAMING_ENABLED = _cfg("STREAMING_ENABLED", True)
+STREAMING_CHUNK_SIZE = _cfg("STREAMING_CHUNK_SIZE", 8)  # Steps per chunk (~667ms audio per chunk)
+
+# =============================================================================
+# OPTIONAL IMPORTS WITH FALLBACKS
+# =============================================================================
+
 try:
     from docx import Document
     DOCX_AVAILABLE = True
@@ -94,19 +131,297 @@ except ImportError:
     BS4_AVAILABLE = False
 
 
-class QwenAudiobookConverter:
-    """Audiobook converter using Qwen Voice API"""
+# =============================================================================
+# FASTER QWEN BACKEND
+# =============================================================================
 
-    def __init__(self, voice_mode: str = "custom_voice", voice_clone_ref_audio: Optional[str] = None):
+class FasterQwenBackend:
+    """Backend using faster-qwen3-tts with CUDA graph optimization"""
+
+    def __init__(self, device: str = DEVICE, dtype: torch.dtype = DTYPE):
+        self.device = device
+        self.dtype = dtype
+        self.model = None
+        self.voice_clone_ref_audio: Optional[str] = None
+        self.voice_clone_ref_text: str = ""
+        self.speaker_embedding_path: Optional[str] = None
+        self.speaker_embedding: Optional[torch.Tensor] = None
+        self.sample_rate: int = 24000
+
+    def initialize(self, voice_mode: str, voice_clone_ref_audio: Optional[str] = None, voice_clone_ref_text: str = "") -> None:
+        """Load the TTS model and set up voice configuration"""
+        print("[INFO] Loading faster-qwen3-tts model...")
+        print("[INFO] This may take a few minutes on first run (downloads model from HuggingFace)")
+
+        model_id = CUSTOM_VOICE_MODEL_ID if voice_mode == "custom_voice" else VOICE_CLONE_MODEL_ID
+
+        try:
+            self.model = FasterQwen3TTS.from_pretrained(
+                model_id,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self.sample_rate = self.model.sample_rate
+            print(f"[OK] Model loaded successfully on {self.device}")
+            print(f"[OK] Sample rate: {self.sample_rate} Hz")
+        except Exception as e:
+            print(f"[ERROR] Failed to load model: {e}")
+            print("Make sure you have:")
+            print("1. NVIDIA GPU with CUDA")
+            print("2. PyTorch >= 2.5.1 with CUDA support")
+            print("3. Sufficient VRAM (at least 6GB recommended)")
+            sys.exit(1)
+
+        if voice_mode == "voice_clone" and voice_clone_ref_audio:
+            self.voice_clone_ref_audio = voice_clone_ref_audio
+            if not Path(voice_clone_ref_audio).exists():
+                print(f"[ERROR] Reference audio not found: {voice_clone_ref_audio}")
+                sys.exit(1)
+
+        if voice_mode == "voice_clone" and voice_clone_ref_text:
+            self.voice_clone_ref_text = voice_clone_ref_text
+
+    def generate_custom_voice(self, text: str) -> np.ndarray:
+        """Generate audio using CustomVoice mode with pre-built speaker"""
+        result = self.model.generate_custom_voice(
+            text=text,
+            language=CUSTOM_VOICE_LANGUAGE,
+            speaker=CUSTOM_VOICE_SPEAKER,
+            instruct=CUSTOM_VOICE_INSTRUCT,
+        )
+        audio_list, sr = result[0] if isinstance(result, tuple) else (result, self.sample_rate)
+        # Return first audio array and sample rate
+        audio = audio_list[0] if isinstance(audio_list, list) else audio_list
+        return audio
+
+    def generate_custom_voice_streaming(self, text: str) -> np.ndarray:
+        """Generate audio using CustomVoice mode with streaming for faster TTFB"""
+        result = self.model.generate_custom_voice_streaming(
+            text=text,
+            language=CUSTOM_VOICE_LANGUAGE,
+            speaker=CUSTOM_VOICE_SPEAKER,
+            instruct=CUSTOM_VOICE_INSTRUCT,
+            chunk_size=STREAMING_CHUNK_SIZE,
+        )
+        # result is a generator yielding (audio_chunk, sr, timing) tuples
+        all_chunks = []
+        sr = self.sample_rate
+        for audio_chunk, chunk_sr, timing in result:
+            all_chunks.append(audio_chunk)
+            sr = chunk_sr
+        if len(all_chunks) == 1:
+            return all_chunks[0]
+        else:
+            return np.concatenate(all_chunks)
+
+    def generate_voice_clone(self, text: str) -> np.ndarray:
+        """Generate audio using Voice Clone mode with ICL or xvector"""
+        if not self.voice_clone_ref_audio:
+            raise ValueError("Reference audio not set for voice cloning")
+
+        # ICL takes priority if ref_text is available on the backend
+        if self.voice_clone_ref_text:
+            result = self.model.generate_voice_clone(
+                text=text,
+                language=VOICE_CLONE_LANGUAGE,
+                ref_audio=self.voice_clone_ref_audio,
+                ref_text=self.voice_clone_ref_text,
+                xvec_only=False,
+                append_silence=VOICE_CLONE_APPEND_SILENCE,
+            )
+        elif VOICE_CLONE_USE_XVECTOR_ONLY or self.speaker_embedding is not None:
+            if self.speaker_embedding is not None:
+                result = self.model.generate_voice_clone(
+                    text=text,
+                    language=VOICE_CLONE_LANGUAGE,
+                    ref_audio=self.voice_clone_ref_audio,
+                    ref_text="",
+                    xvec_only=True,
+                    voice_clone_prompt={
+                        "ref_spk_embedding": [self.speaker_embedding],
+                    },
+                )
+            else:
+                result = self.model.generate_voice_clone(
+                    text=text,
+                    language=VOICE_CLONE_LANGUAGE,
+                    ref_audio=self.voice_clone_ref_audio,
+                    ref_text="",
+                    xvec_only=True,
+                )
+        else:
+            raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
+
+        audio_list, sr = result[0] if isinstance(result, tuple) else (result, self.sample_rate)
+        audio = audio_list[0] if isinstance(audio_list, list) else audio_list
+        return audio
+
+    def generate_voice_clone_streaming(self, text: str) -> np.ndarray:
+        """Generate audio using Voice Clone mode with streaming"""
+        if not self.voice_clone_ref_audio:
+            raise ValueError("Reference audio not set for voice cloning")
+
+        non_streaming_mode = False  # Use step-by-step text feeding for streaming
+
+        # ICL takes priority if ref_text is available on the backend
+        if self.voice_clone_ref_text:
+            result = self.model.generate_voice_clone_streaming(
+                text=text,
+                language=VOICE_CLONE_LANGUAGE,
+                ref_audio=self.voice_clone_ref_audio,
+                ref_text=self.voice_clone_ref_text,
+                xvec_only=False,
+                append_silence=VOICE_CLONE_APPEND_SILENCE,
+                chunk_size=STREAMING_CHUNK_SIZE,
+                non_streaming_mode=non_streaming_mode,
+            )
+        elif VOICE_CLONE_USE_XVECTOR_ONLY or self.speaker_embedding is not None:
+            if self.speaker_embedding is not None:
+                result = self.model.generate_voice_clone_streaming(
+                    text=text,
+                    language=VOICE_CLONE_LANGUAGE,
+                    ref_audio=self.voice_clone_ref_audio,
+                    ref_text="",
+                    xvec_only=True,
+                    voice_clone_prompt={"ref_spk_embedding": [self.speaker_embedding]},
+                    chunk_size=STREAMING_CHUNK_SIZE,
+                    non_streaming_mode=non_streaming_mode,
+                )
+            else:
+                result = self.model.generate_voice_clone_streaming(
+                    text=text,
+                    language=VOICE_CLONE_LANGUAGE,
+                    ref_audio=self.voice_clone_ref_audio,
+                    ref_text="",
+                    xvec_only=True,
+                    chunk_size=STREAMING_CHUNK_SIZE,
+                    non_streaming_mode=non_streaming_mode,
+                )
+        else:
+            raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
+
+        all_chunks = []
+        sr = self.sample_rate
+        for audio_chunk, chunk_sr, timing in result:
+            all_chunks.append(audio_chunk)
+            sr = chunk_sr
+        if len(all_chunks) == 1:
+            return all_chunks[0]
+        else:
+            return np.concatenate(all_chunks)
+
+    def generate_voice_design(self, text: str) -> np.ndarray:
+        """Generate audio using VoiceDesign mode (instruction-based)"""
+        result = self.model.generate_voice_design(
+            text=text,
+            language=VOICE_DESIGN_LANGUAGE,
+            instruct=VOICE_DESIGN_DESCRIPTION,
+        )
+        audio_list, sr = result[0] if isinstance(result, tuple) else (result, self.sample_rate)
+        audio = audio_list[0] if isinstance(audio_list, list) else audio_list
+        return audio
+
+    def generate_voice_design_streaming(self, text: str) -> np.ndarray:
+        """Generate audio using VoiceDesign mode with streaming"""
+        result = self.model.generate_voice_design_streaming(
+            text=text,
+            language=VOICE_DESIGN_LANGUAGE,
+            instruct=VOICE_DESIGN_DESCRIPTION,
+            chunk_size=STREAMING_CHUNK_SIZE,
+        )
+        all_chunks = []
+        sr = self.sample_rate
+        for audio_chunk, chunk_sr, timing in result:
+            all_chunks.append(audio_chunk)
+            sr = chunk_sr
+        if len(all_chunks) == 1:
+            return all_chunks[0]
+        else:
+            return np.concatenate(all_chunks)
+
+    def extract_speaker_embedding(self, audio_path: str) -> torch.Tensor:
+        """Extract speaker embedding from reference audio for faster reuse"""
+        print(f"[INFO] Extracting speaker embedding from {audio_path}...")
+        try:
+            prompt_items = self.model.model.create_voice_clone_prompt(
+                ref_audio=audio_path,
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+            spk_emb = prompt_items[0].ref_spk_embedding
+            print("[OK] Speaker embedding extracted (4KB, 2048-dim)")
+            return spk_emb
+        except Exception as e:
+            print(f"[WARNING] Could not extract speaker embedding: {e}")
+            return None
+
+
+# =============================================================================
+# AUDIOBOOK CONVERTER
+# =============================================================================
+
+class QwenAudiobookConverter:
+    """Audiobook converter using faster-qwen3-tts backend"""
+
+    def __init__(self, voice_mode: str = "custom_voice", voice_clone_ref_audio: Optional[str] = None,
+                 voice_clone_ref_text: Optional[str] = None, force_xvector: bool = False):
         self.voice_mode = voice_mode
         self.voice_clone_ref_audio = voice_clone_ref_audio
-        self.voice_clone_ref_text = ""
+        # Use passed ref_text first, then config.py fallback
+        self.voice_clone_ref_text = voice_clone_ref_text if voice_clone_ref_text else ""
         self.setup_logging()
         self.setup_directories()
         self.validate_configuration()
-        self.client = None
-        self.api_info: Dict[str, Any] = {}
-        self.init_qwen_client()
+
+        # Initialize faster-qwen3-tts backend
+        self.backend = FasterQwenBackend(device=DEVICE, dtype=DTYPE)
+        try:
+            init_ref_text = self.voice_clone_ref_text or _cfg("VOICE_CLONE_REF_TEXT", "")
+            if init_ref_text and voice_mode == "voice_clone":
+                self.backend.initialize(voice_mode, voice_clone_ref_audio, init_ref_text)
+            else:
+                self.backend.initialize(voice_mode, voice_clone_ref_audio)
+            print("[OK] Backend initialized (faster-qwen3-tts)")
+        except Exception as e:
+            print(f"[FATAL] Failed to initialize backend: {e}")
+            sys.exit(1)
+
+        # If voice clone, determine mode and set up ref_text or xvector
+        if voice_mode == "voice_clone" and voice_clone_ref_audio:
+            # Step 1: Try to find ref_text from multiple sources
+            caller_ref_text = voice_clone_ref_text or ""
+            config_ref_text = _cfg("VOICE_CLONE_REF_TEXT", "")
+            
+            # Priority: caller text > config file
+            available_ref_text = caller_ref_text if caller_ref_text else config_ref_text
+            
+            # Determine which mode we should use
+            # ICL mode takes priority if ref_text is available
+            has_ref_text = bool(available_ref_text)
+            force_xvec_mode = force_xvector and not has_ref_text
+            use_xvect_config = VOICE_CLONE_USE_XVECTOR_ONLY and not has_ref_text
+            
+            if has_ref_text:
+                # ICL mode - ref_text provided, use it (overrides xvector checkbox)
+                self.voice_clone_ref_text = available_ref_text
+                self.backend.voice_clone_ref_text = available_ref_text
+                print(f"[INFO] Voice clone ICL mode active (ref_text from {'caller' if caller_ref_text else 'config.py'})")
+            elif force_xvec_mode or use_xvect_config:
+                # XVector-only mode - no ref_text available or forced without ref_text
+                self.voice_clone_info = Path(voice_clone_ref_audio).name
+                emb = self.backend.extract_speaker_embedding(voice_clone_ref_audio)
+                if emb is not None:
+                    self.backend.speaker_embedding = emb
+                print("[INFO] Using xvector-only voice clone mode (speaker embedding extracted)")
+            else:
+                # No ref_text and no force_xvector - fallback to xvector-only
+                print("[WARNING] No ref_text provided for voice clone.")
+                print("  Falling back to xvector-only mode (no transcription needed).")
+                self.voice_clone_info = Path(voice_clone_ref_audio).name
+                emb = self.backend.extract_speaker_embedding(voice_clone_ref_audio)
+                if emb is not None:
+                    self.backend.speaker_embedding = emb
+                print("[INFO] Using xvector-only voice clone mode (speaker embedding extracted)")
 
     def setup_logging(self):
         """Setup logging configuration"""
@@ -127,22 +442,6 @@ class QwenAudiobookConverter:
         for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)
 
-    def transcribe_audio(self, audio_path: str) -> str:
-        """Transcribe audio file using Qwen's Whisper transcription"""
-        transcribe_api = self._resolve_api_name("/transcribe_audio", "/run_transcribe_audio")
-        try:
-            self.logger.info(f"Transcribing audio: {audio_path}")
-            result = self.client.predict(
-                audio=handle_file(audio_path),
-                api_name=transcribe_api
-            )
-            transcribed_text = result if isinstance(result, str) else str(result)
-            self.logger.info(f"Transcription complete: {transcribed_text[:100]}...")
-            return transcribed_text.strip()
-        except Exception as e:
-            self.logger.error(f"Transcription failed: {e}")
-            raise
-
     def validate_configuration(self):
         """Validate configuration settings"""
         if self.voice_mode == "voice_clone":
@@ -151,71 +450,24 @@ class QwenAudiobookConverter:
                 print("Voice Clone mode requires a reference audio file.")
                 print("Use --voice-sample <path> to specify the reference audio.")
                 sys.exit(1)
-            
+
             if not Path(self.voice_clone_ref_audio).exists():
                 print("[ERROR] Configuration Error!")
                 print(f"Reference audio file not found: {self.voice_clone_ref_audio}")
                 sys.exit(1)
-            
-            # Transcribe the audio if client is available (will be done after init)
-            # For now, we'll transcribe it in init_qwen_client if needed
 
-    def init_qwen_client(self):
-        """Initialize Qwen Gradio client"""
-        try:
-            self.logger.info(f"Connecting to Qwen API at {QWEN_API_URL}...")
-            # Suppress gradio_client's print statements that cause encoding issues on Windows
-            import io
-            old_stdout = sys.stdout
-            sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', errors='replace')
-            try:
-                self.client = Client(QWEN_API_URL)
-            finally:
-                sys.stdout = old_stdout
-            self.api_info = self._load_api_info()
-            self.logger.info("Connected to Qwen API")
-            print("[OK] Connected to Qwen API")
-            
-            # If voice clone mode, transcribe the reference audio
-            if self.voice_mode == "voice_clone" and self.voice_clone_ref_audio:
-                print("[INFO] Transcribing reference audio for voice cloning...")
-                self.voice_clone_ref_text = self.transcribe_audio(self.voice_clone_ref_audio)
-                print(f"[OK] Transcription: {self.voice_clone_ref_text[:100]}...")
-        except Exception as e:
-            print("[ERROR] Qwen API initialization failed!")
-            print(f"API endpoint: {QWEN_API_URL}")
-            print("Make sure:")
-            print("1. Qwen Gradio server is running")
-            print("2. The server is accessible at the configured URL")
-            print("3. The endpoint URL is correct")
-            print("4. Your installed Qwen3-TTS version matches this converter's API expectations")
-            print(f"Error: {e}")
-            sys.exit(1)
+    def get_cache_path(self, text: str) -> Path:
+        """Get cache path for text chunk"""
+        content = (
+            f"{text}_{self.voice_mode}_"
+            f"{CUSTOM_VOICE_SPEAKER if self.voice_mode == 'custom_voice' else ''}_"
+            f"{Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ''}"
+        )
+        hash_obj = hashlib.md5(content.encode())
+        return Path("cache/audio_chunks") / f"{hash_obj.hexdigest()}.wav"
 
-    def _load_api_info(self) -> Dict[str, Any]:
-        """Load available API metadata from Gradio app."""
-        try:
-            return self.client.view_api(return_format="dict")
-        except Exception as exc:
-            self.logger.warning(f"Unable to read API metadata: {exc}")
-            return {}
-
-    def _resolve_api_name(self, *candidates: str) -> str:
-        """Return the first available api_name from candidate list."""
-        named_endpoints = self.api_info.get("named_endpoints", {})
-        for candidate in candidates:
-            if candidate in named_endpoints:
-                return candidate
-        return candidates[0]
-
-    def _endpoint_accepts_param(self, api_name: str, param_name: str) -> bool:
-        """Check whether endpoint input schema includes the given parameter."""
-        endpoint = self.api_info.get("named_endpoints", {}).get(api_name, {})
-        parameters = endpoint.get("parameters", [])
-        return any(parameter.get("parameter_name") == param_name for parameter in parameters)
-
-    def generate_chunk_via_qwen(self, text: str, chunk_num: int) -> Optional[str]:
-        """Generate audio chunk using Qwen API"""
+    def generate_chunk_via_backend(self, text: str, chunk_num: int) -> Optional[str]:
+        """Generate audio chunk using faster-qwen3-tts backend"""
         try:
             # Check cache first
             cache_path = self.get_cache_path(text)
@@ -225,26 +477,56 @@ class QwenAudiobookConverter:
                 self.logger.debug(f"Using cached audio for chunk {chunk_num}")
                 return str(output_path)
 
-            # Generate audio based on selected mode
+            # Generate audio based on selected mode and settings
+            start_time = time.time()
+
             if self.voice_mode == "custom_voice":
-                result = self._generate_custom_voice(text)
+                if STREAMING_ENABLED:
+                    audio = self.backend.generate_custom_voice_streaming(text)
+                else:
+                    audio = self.backend.generate_custom_voice(text)
             elif self.voice_mode == "voice_clone":
-                result = self._generate_voice_clone(text)
+                if not self.backend.voice_clone_ref_audio:
+                    raise ValueError("Reference audio not set for voice cloning")
+
+                # ICL takes priority if ref_text is available on the backend
+                if self.backend.voice_clone_ref_text:
+                    if STREAMING_ENABLED:
+                        audio = self.backend.generate_voice_clone_streaming(text)
+                    else:
+                        audio = self.backend.generate_voice_clone(text)
+                elif VOICE_CLONE_USE_XVECTOR_ONLY or self.backend.speaker_embedding is not None:
+                    # XVector mode - only use when no ref_text but xvector configured
+                    if STREAMING_ENABLED:
+                        audio = self.backend.generate_voice_clone_streaming(text)
+                    else:
+                        audio = self.backend.generate_voice_clone(text)
+                else:
+                    raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
+            elif self.voice_mode == "voice_design":
+                if STREAMING_ENABLED:
+                    audio = self.backend.generate_voice_design_streaming(text)
+                else:
+                    audio = self.backend.generate_voice_design(text)
             else:
                 raise ValueError(f"Unknown voice mode: {self.voice_mode}")
 
-            if not result or len(result) < 2:
-                raise RuntimeError("Qwen API returned invalid result")
+            elapsed = time.time() - start_time
+            rtf = elapsed / (len(audio) / self.backend.sample_rate) if len(audio) > 0 else 0
+            self.logger.info(
+                f"Chunk {chunk_num}: {elapsed:.1f}s, RTF: {rtf:.2f}, "
+                f"Audio length: {len(audio)/self.backend.sample_rate:.1f}s"
+            )
 
-            audio_path = result[0]  # First element is the audio file path
-            status = result[1] if len(result) > 1 else ""
-
-            if not audio_path or not Path(audio_path).exists():
-                raise RuntimeError(f"Generated audio file not found: {audio_path}")
-
-            # Copy to chunks directory
+            # Convert numpy array to WAV file in chunks folder
             output_path = Path("chunks") / f"chunk_{chunk_num:04d}.wav"
-            shutil.copy2(audio_path, output_path)
+            audio_segment = AudioSegment(
+                (audio * 32768).astype(np.int16).tobytes(),
+                frame_rate=self.backend.sample_rate,
+                sample_width=2,  # 16-bit
+                channels=1,
+            )
+            audio_segment.export(str(output_path), format="wav")
 
             # Cache the result
             shutil.copy2(output_path, cache_path)
@@ -253,60 +535,20 @@ class QwenAudiobookConverter:
             return str(output_path)
 
         except Exception as e:
-            self.logger.error(f"Qwen chunk processing failed for chunk {chunk_num}: {e}")
+            self.logger.error(f"Backend chunk processing failed for chunk {chunk_num}: {e}")
             return None
 
-    def _generate_custom_voice(self, text: str) -> Tuple:
-        """Generate audio using CustomVoice mode"""
-        custom_api = self._resolve_api_name("/run_custom_voice", "/generate_custom_voice")
-        payload = dict(
-            text=text,
-            language=CUSTOM_VOICE_LANGUAGE,
-            speaker=CUSTOM_VOICE_SPEAKER,
-            instruct=CUSTOM_VOICE_INSTRUCT,
-        )
-        if self._endpoint_accepts_param(custom_api, "model_id_cv"):
-            payload["model_id_cv"] = CUSTOM_VOICE_MODEL_ID
-        elif self._endpoint_accepts_param(custom_api, "model_size"):
-            payload["model_size"] = CUSTOM_VOICE_MODEL_SIZE
-
-        if self._endpoint_accepts_param(custom_api, "seed"):
-            payload["seed"] = CUSTOM_VOICE_SEED
-
-        return self.client.predict(**payload, api_name=custom_api)
-
-    def _generate_voice_clone(self, text: str) -> Tuple:
-        """Generate audio using Voice Clone mode"""
-        if not Path(self.voice_clone_ref_audio).exists():
-            raise FileNotFoundError(f"Reference audio not found: {self.voice_clone_ref_audio}")
-
-        if not self.voice_clone_ref_text:
-            raise ValueError("Reference text is required for voice cloning. Transcription may have failed.")
-
-        return self.client.predict(
-            ref_audio=handle_file(self.voice_clone_ref_audio),
-            ref_text=self.voice_clone_ref_text,
-            target_text=text,
-            language=VOICE_CLONE_LANGUAGE,
-            use_xvector_only=VOICE_CLONE_USE_XVECTOR_ONLY,
-            model_size=VOICE_CLONE_MODEL_SIZE,
-            max_chunk_chars=VOICE_CLONE_MAX_CHUNK_CHARS,
-            chunk_gap=VOICE_CLONE_CHUNK_GAP,
-            seed=VOICE_CLONE_SEED,
-            api_name="/generate_voice_clone"
-        )
-
     def process_chunk_with_retry(self, args: Tuple[int, str]) -> bool:
-        """Process chunk with retry logic and rate limiting"""
+        """Process chunk with retry logic"""
         chunk_num, text = args
 
-        # Small delay between chunks to avoid rate limiting (only if not first chunk)
+        # Small delay between chunks to allow GPU memory management
         if chunk_num > 1:
             time.sleep(MIN_DELAY_BETWEEN_CHUNKS)
 
         for attempt in range(MAX_RETRIES):
             try:
-                result = self.generate_chunk_via_qwen(text, chunk_num)
+                result = self.generate_chunk_via_backend(text, chunk_num)
                 if result and Path(result).exists():
                     return True
                 else:
@@ -321,12 +563,6 @@ class QwenAudiobookConverter:
 
         self.logger.error(f"Chunk {chunk_num} failed after {MAX_RETRIES} attempts")
         return False
-
-    def get_cache_path(self, text: str) -> Path:
-        """Get cache path for text chunk"""
-        content = f"{text}_{self.voice_mode}_{CUSTOM_VOICE_SPEAKER if self.voice_mode == 'custom_voice' else Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ''}"
-        hash_obj = hashlib.md5(content.encode())
-        return Path("cache/audio_chunks") / f"{hash_obj.hexdigest()}.wav"
 
     def extract_text_from_epub(self, file_path: Path) -> str:
         """Extract text from EPUB with fallback methods"""
@@ -459,7 +695,7 @@ class QwenAudiobookConverter:
             pdf_reader = PyPDF2.PdfReader(file)
             total_pages = len(pdf_reader.pages)
             self.logger.info(f"PDF has {total_pages} pages")
-            
+
             for page_num, page in enumerate(pdf_reader.pages, 1):
                 try:
                     page_text = page.extract_text()
@@ -470,7 +706,7 @@ class QwenAudiobookConverter:
                 except Exception as e:
                     self.logger.warning(f"Failed to extract page {page_num}: {e}")
                     continue
-            
+
             self.logger.info(f"Extracted text from {total_pages} pages, {len(text)} characters total")
         return self._clean_text(text)
 
@@ -552,7 +788,7 @@ class QwenAudiobookConverter:
                 if results is not None and not results.get(i, False):
                     missing_chunks.append(i)
                     continue
-                    
+
                 chunk_file = Path("chunks") / f"chunk_{i:04d}.wav"
                 if chunk_file.exists():
                     try:
@@ -598,7 +834,7 @@ class QwenAudiobookConverter:
                     chunk_count += 1
                 except Exception as e:
                     self.logger.warning(f"Failed to delete {chunk_file}: {e}")
-            
+
             # Clean up cache folder
             cache_count = 0
             cache_dir = Path("cache/audio_chunks")
@@ -609,7 +845,7 @@ class QwenAudiobookConverter:
                         cache_count += 1
                     except Exception as e:
                         self.logger.warning(f"Failed to delete cache file {cache_file}: {e}")
-            
+
             if chunk_count > 0 or cache_count > 0:
                 self.logger.info(f"Cleaned up {chunk_count} chunk files and {cache_count} cache files")
                 print(f"[INFO] Cleaned up {chunk_count} chunk files and {cache_count} cache files")
@@ -617,7 +853,7 @@ class QwenAudiobookConverter:
             self.logger.warning(f"Cleanup failed: {e}")
 
     def convert_book(self, file_path: Path) -> bool:
-        """Convert a single book to audiobook using Qwen API"""
+        """Convert a single book to audiobook using faster-qwen3-tts"""
         self.logger.info(f"Converting: {file_path.name}")
         start_time = time.time()
 
@@ -638,12 +874,18 @@ class QwenAudiobookConverter:
                 self.logger.error("No chunks created")
                 return False
 
-            # Log chunk info
+            # Log chunk info and estimate time based on streaming performance
             chunk_sizes = [len(chunk.split()) for chunk in chunks]
             avg_chunk_size = sum(chunk_sizes) / len(chunk_sizes) if chunk_sizes else 0
             self.logger.info(f"Split into {total_chunks} chunks (avg {avg_chunk_size:.0f} words per chunk)")
-            print(f"[INFO] Processing {total_chunks} chunks via Qwen API...")
-            print(f"[INFO] Estimated time: ~{total_chunks * 4} minutes (4 min per chunk)")
+
+            # Estimate time: on RTX 4090, expected ~15-30 seconds per 1200-word chunk
+            est_seconds_per_chunk = 20
+            est_time = total_chunks * est_seconds_per_chunk
+            est_minutes = int(est_time // 60)
+            est_secs = est_time % 60
+            print(f"[INFO] Processing {total_chunks} chunks via faster-qwen3-tts...")
+            print(f"[INFO] Estimated time: ~{est_minutes} minutes ({est_secs} seconds)")
 
             # Process chunks - process in order to ensure correct naming
             chunk_args = [(i + 1, chunk) for i, chunk in enumerate(chunks)]
@@ -654,21 +896,20 @@ class QwenAudiobookConverter:
 
             # Track results by chunk number
             results = {}  # chunk_num -> success (bool)
-            
+
             # Process chunks sequentially to ensure correct order and naming
-            # This ensures chunks are named 1, 2, 3, 4... in order
             for chunk_num, chunk_text in chunk_args:
                 try:
                     result = self.process_chunk_with_retry((chunk_num, chunk_text))
                     results[chunk_num] = result
-                    
+
                     if result:
                         print(f"[OK] Chunk {chunk_num:3d}/{total_chunks} completed")
                         self.logger.info(f"+ Chunk {chunk_num}/{total_chunks} completed")
                     else:
                         print(f"[FAIL] Chunk {chunk_num:3d}/{total_chunks} FAILED")
                         self.logger.error(f"- Chunk {chunk_num}/{total_chunks} failed")
-                        
+
                 except Exception as e:
                     results[chunk_num] = False
                     print(f"[ERROR] Chunk {chunk_num:3d}/{total_chunks} ERROR: {e}")
@@ -679,15 +920,18 @@ class QwenAudiobookConverter:
             print(f"CHUNK PROCESSING COMPLETE")
             print(f"Successful: {successful_chunks}/{total_chunks}")
             print(f"{'=' * 50}")
-            self.logger.info(f"Qwen processing completed: {successful_chunks}/{total_chunks} chunks")
+            self.logger.info(f"Processing completed: {successful_chunks}/{total_chunks} chunks")
 
             if successful_chunks == 0:
                 self.logger.error("No chunks were successfully processed")
-                self.cleanup_chunks()  # Cleanup even on failure
+                self.cleanup_chunks()
                 return False
 
             if successful_chunks < total_chunks:
-                self.logger.warning(f"Only {successful_chunks}/{total_chunks} chunks succeeded. Proceeding with partial audiobook.")
+                self.logger.warning(
+                    f"Only {successful_chunks}/{total_chunks} chunks succeeded. "
+                    f"Proceeding with partial audiobook."
+                )
 
             # Combine chunks (only the successful ones)
             output_path = Path(AUDIOBOOKS_FOLDER) / f"{file_path.stem}.{AUDIO_FORMAT}"
@@ -710,28 +954,27 @@ class QwenAudiobookConverter:
             self.logger.error(f"Conversion failed: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            # Cleanup on exception
             self.cleanup_chunks()
             return False
 
     def run(self):
         """Main conversion process"""
         print("=" * 70)
-        print("QWEN-BASED AUDIOBOOK CONVERTER")
+        print("QWEN AUDIOBOOK CONVERTER (faster-qwen3-tts backend)")
         print("=" * 70)
         print(f"Books folder: {BOOKS_FOLDER}")
         print(f"Output folder: {AUDIOBOOKS_FOLDER}")
-        print(f"Qwen API endpoint: {QWEN_API_URL}")
         print(f"Voice mode: {self.voice_mode}")
-        print(f"Model size: 1.7B (always)")
+        print(f"Model: {'CustomVoice' if self.voice_mode == 'custom_voice' else 'VoiceClone/VoiceDesign'}")
+        print(f"Device: {DEVICE}")
         if self.voice_mode == "custom_voice":
             print(f"Speaker: {CUSTOM_VOICE_SPEAKER}")
             print(f"Language: {CUSTOM_VOICE_LANGUAGE}")
-        elif self.voice_mode == "voice_clone":
-            print(f"Reference audio: {Path(self.voice_clone_ref_audio).name}")
-            print(f"Language: {VOICE_CLONE_LANGUAGE}")
+        elif self.voice_mode in ("voice_clone", "voice_design"):
+            print(f"Backend model: {VOICE_CLONE_MODEL_ID if self.voice_mode == 'voice_clone' else CUSTOM_VOICE_MODEL_ID}")
         print(f"Output format: {AUDIO_FORMAT}")
-        print(f"Max workers: {MAX_WORKERS}")
+        print(f"Streaming: {'enabled' if STREAMING_ENABLED else 'disabled'}")
+        print(f"Chunk size: {STREAMING_CHUNK_SIZE} steps")
         print("=" * 70)
 
         # Check for books
@@ -753,8 +996,8 @@ class QwenAudiobookConverter:
             sample_file = books_dir / "sample.txt"
             with open(sample_file, 'w') as f:
                 f.write("This is a sample audiobook for testing the Qwen-based converter. "
-                        "The system will send this text to the Qwen API for voice generation. "
-                        "You can replace this file with your own books to convert.")
+                        "The system uses faster-qwen3-tts with CUDA graph optimization for "
+                        "fast voice generation. You can replace this file with your own books to convert.")
             print(f"[INFO] Created sample file: {sample_file}")
             return
 
@@ -791,10 +1034,14 @@ class QwenAudiobookConverter:
             print(f"\n[INFO] Audiobooks saved to: {AUDIOBOOKS_FOLDER}/")
 
 
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+
 def main():
     """Entry point with argparse"""
     parser = argparse.ArgumentParser(
-        description="Convert books to audiobooks using Qwen Voice Model",
+        description="Convert books to audiobooks using faster-qwen3-tts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -803,25 +1050,47 @@ Examples:
 
   # Use voice cloning with reference audio
   python audiobook_converter.py --voice-clone --voice-sample path/to/reference.wav
+
+  # Use voice design mode
+  python audiobook_converter.py --voice-design
+
+  # Use xvector-only mode (no transcription needed for voice clone)
+  python audiobook_converter.py --voice-clone --voice-sample ref.wav --xvector
+
         """
     )
-    
+
     parser.add_argument(
         "--voice-clone",
         action="store_true",
         help="Use voice cloning mode instead of custom voice (requires --voice-sample)"
     )
-    
+
     parser.add_argument(
         "--voice-sample",
         type=str,
-        help="Path to reference audio file for voice cloning (WAV format). Audio will be automatically transcribed."
+        help="Path to reference audio file for voice cloning (WAV format)"
     )
-    
+
+    parser.add_argument(
+        "--xvector",
+        action="store_true",
+        help="Use xvector-only mode for voice clone (no transcription needed)"
+    )
+
+    parser.add_argument(
+        "--voice-design",
+        action="store_true",
+        help="Use voice design mode (instruction-based voice generation)"
+    )
+
     args = parser.parse_args()
-    
+
     # Determine voice mode
-    if args.voice_clone:
+    if args.voice_design:
+        voice_mode = "voice_design"
+        voice_clone_ref_audio = None
+    elif args.voice_clone:
         if not args.voice_sample:
             print("[ERROR] --voice-clone requires --voice-sample")
             print("Usage: python audiobook_converter.py --voice-clone --voice-sample <path>")
@@ -831,12 +1100,14 @@ Examples:
     else:
         voice_mode = "custom_voice"
         voice_clone_ref_audio = None
-    
+
     try:
         converter = QwenAudiobookConverter(
             voice_mode=voice_mode,
-            voice_clone_ref_audio=voice_clone_ref_audio
+            voice_clone_ref_audio=voice_clone_ref_audio,
+            force_xvector=args.xvector
         )
+
         converter.run()
     except KeyboardInterrupt:
         print("\n[WARNING] Shutdown requested by user")

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+chunks/
+audiobooks/
+logs/
+cache/
+.env
+.kilo/
