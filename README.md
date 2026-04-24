@@ -34,13 +34,6 @@ No it's not broken, it's a raw mp3 file download it and play it, you can't embed
 
 ## 🧠 Performance Benchmarks (1.7B Model)
 
-| GPU | RTF | Time-to-First-Audio | Speedup vs Baseline |
-|---|---|---|---|
-| RTX 4090 | 4.22x | 174ms | **5.1x** |
-| H100 80GB | 3.30x | 241ms | **6.3x** |
-| RTX 4060 (Windows) | 1.83x | 460ms | **7.9x** |
-| Jetson AGX Orin | 1.09x | 693ms | **6.0x** |
-
 **RTF > 1.0 means faster than real-time.** On an RTX 4090, a 1200-word chunk (~1 minute audio) takes ~30 seconds to generate.
 
 ## 🚀 Quick Start
