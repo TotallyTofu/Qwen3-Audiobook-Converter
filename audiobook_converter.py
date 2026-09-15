@@ -8,6 +8,7 @@ Requires: NVIDIA GPU with CUDA, PyTorch >= 2.5.1
 """
 
 import os
+import math
 import shutil
 import logging
 import hashlib
@@ -108,6 +109,19 @@ MIN_DELAY_BETWEEN_CHUNKS = _cfg("MIN_DELAY_BETWEEN_CHUNKS", 0.5)
 STREAMING_ENABLED = _cfg("STREAMING_ENABLED", True)
 STREAMING_CHUNK_SIZE = _cfg("STREAMING_CHUNK_SIZE", 8)  # Steps per chunk (~667ms audio per chunk)
 
+# TTS token budget settings (chunk truncation prevention)
+# faster-qwen3-tts caps each generation at max_seq_len TOTAL tokens (prompt +
+# audio). If the chunk's speech needs more audio tokens than that, the tail of
+# the chunk is silently dropped. These knobs size the per-chunk budget and
+# detect truncation after generation. See config.py for details.
+FASTER_QWEN_MAX_SEQ_LEN = _cfg("FASTER_QWEN_MAX_SEQ_LEN", 8192)
+TTS_WORDS_PER_MIN = _cfg("TTS_WORDS_PER_MIN", 100)
+TTS_CODEC_TOKENS_PER_SEC = _cfg("TTS_CODEC_TOKENS_PER_SEC", 12)
+TTS_BUDGET_SAFETY_FACTOR = _cfg("TTS_BUDGET_SAFETY_FACTOR", 1.2)
+TTS_MIN_MAX_NEW_TOKENS = _cfg("TTS_MIN_MAX_NEW_TOKENS", 256)
+TTS_VOICE_CLONE_REF_MARGIN = _cfg("TTS_VOICE_CLONE_REF_MARGIN", 512)
+TTS_TOO_SHORT_RATIO = _cfg("TTS_TOO_SHORT_RATIO", 0.30)
+
 # =============================================================================
 # OPTIONAL IMPORTS WITH FALLBACKS
 # =============================================================================
@@ -129,6 +143,176 @@ try:
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
+
+
+# =============================================================================
+# TTS TOKEN BUDGET HELPERS (chunk truncation prevention)
+# =============================================================================
+
+class ChunkBudgetError(RuntimeError):
+    """A chunk cannot be fully generated within the token budget.
+
+    `deterministic` is True when retrying with the same settings cannot
+    succeed (token cap hit, or text too long for the configured
+    max_seq_len). When False, a retry with a fresh seed may succeed.
+    """
+
+    def __init__(self, message: str, deterministic: bool = True):
+        super().__init__(message)
+        self.deterministic = deterministic
+
+
+def estimate_prefill_tokens(text: str, voice_mode: str = "custom_voice") -> int:
+    """Conservative estimate of the prompt (prefill) token count for a chunk.
+
+    The talker prefill holds the entire chunk text (~1.3-1.5 tokens per
+    English word) plus system/speaker/instruct tokens. Voice-clone ICL mode
+    additionally places the reference audio's codec tokens in context.
+    """
+    words = len(text.split())
+    prefill = int(words * 1.5) + 300
+    if voice_mode == "voice_clone":
+        prefill += TTS_VOICE_CLONE_REF_MARGIN
+    return prefill
+
+
+def plan_chunk_generation(text: str, max_seq_len: int, voice_mode: str = "custom_voice") -> Tuple[int, float]:
+    """Compute the max_new_tokens budget for one chunk.
+
+    Returns (max_new_tokens, expected_seconds). Raises ChunkBudgetError
+    (deterministic) when the chunk cannot fit in `max_seq_len`, with a
+    message that states the exact numbers and the two remedies.
+    """
+    words = len(text.split())
+    if words == 0:
+        raise ChunkBudgetError("Chunk text is empty; nothing to generate.", deterministic=True)
+
+    expected_sec = words / TTS_WORDS_PER_MIN * 60.0
+    needed = math.ceil(expected_sec * TTS_CODEC_TOKENS_PER_SEC * TTS_BUDGET_SAFETY_FACTOR)
+    needed = max(needed, TTS_MIN_MAX_NEW_TOKENS)
+
+    prefill_est = estimate_prefill_tokens(text, voice_mode)
+    budget = max_seq_len - 1 - prefill_est
+
+    if budget < TTS_MIN_MAX_NEW_TOKENS:
+        raise ChunkBudgetError(
+            f"Chunk too long: ~{words} words need ~{prefill_est} prompt tokens, leaving only "
+            f"{budget} audio tokens in max_seq_len={max_seq_len} (need >= {TTS_MIN_MAX_NEW_TOKENS}). "
+            f"Lower CHUNK_SIZE_WORDS or raise FASTER_QWEN_MAX_SEQ_LEN.",
+            deterministic=True,
+        )
+
+    if needed > budget:
+        raise ChunkBudgetError(
+            f"Chunk would be truncated: ~{words} words need ~{needed} audio tokens "
+            f"(expected speech ~{expected_sec:.0f}s x {TTS_BUDGET_SAFETY_FACTOR} safety), but only "
+            f"{budget} fit in max_seq_len={max_seq_len} after ~{prefill_est} prompt tokens. "
+            f"Raise FASTER_QWEN_MAX_SEQ_LEN to >= {prefill_est + needed + 1} or lower CHUNK_SIZE_WORDS.",
+            deterministic=True,
+        )
+
+    return needed, expected_sec
+
+
+def check_chunk_audio(actual_sec: float, max_new_tokens: int, expected_sec: float) -> None:
+    """Detect silent truncation after generation.
+
+    - Cap hit: a true truncation stops within 1-2 codec frames (~0.2s) of
+      the exact cap (max_new_tokens/12 s), so only audio ending within 3s of
+      the cap is flagged. A natural EOS at the end of the full text finishes
+      well below the cap (the budget carries a safety factor), even when the
+      model narrates slower than TTS_WORDS_PER_MIN estimates.
+    - Too short: audio is far below the expected speech length, likely a
+      premature EOS (retryable). The floor is TTS_TOO_SHORT_RATIO (0.30),
+      calibrated 2026-09-11: the model narrates 150-word chunks at ~2x the
+      85-wpm budgeting rate, so COMPLETE audio measures 0.34-0.53 of the
+      estimate. A 0.40 floor sat inside that band and dropped good chunks;
+      0.30 passes all observed complete audio while still flagging audio
+      missing >70% of the text.
+    """
+    cap_sec = max_new_tokens / TTS_CODEC_TOKENS_PER_SEC
+    if actual_sec >= cap_sec - 3.0:
+        raise ChunkBudgetError(
+            f"Generation hit the token cap: {actual_sec:.1f}s of audio at the "
+            f"{max_new_tokens}-token budget (~{cap_sec:.0f}s). The end of the chunk was cut off. "
+            f"Raise FASTER_QWEN_MAX_SEQ_LEN or lower CHUNK_SIZE_WORDS.",
+            deterministic=True,
+        )
+    if actual_sec < expected_sec * TTS_TOO_SHORT_RATIO:
+        raise ChunkBudgetError(
+            f"Audio is far shorter than expected: {actual_sec:.1f}s for ~{expected_sec:.0f}s of speech "
+            f"(floor {TTS_TOO_SHORT_RATIO:.0%}). Likely premature EOS; retrying.",
+            deterministic=False,
+        )
+
+
+def check_chunk_audio_quality(audio: np.ndarray, sample_rate: int) -> None:
+    """Detect long-context audio degradation (garbled, noise-like output).
+
+    The Qwen3-TTS talker is trained on short utterances. When a single
+    generation runs too long, it drifts out of distribution and starts
+    emitting noise-like codec tokens. That shows up as a sharp rise in
+    spectral flatness (noise-likeness): clean speech measures ~0.05-0.15
+    per second, degraded audio sits at ~0.3-0.7. This check would have
+    caught the 2026-09-11 Labyrinths chunk that garbled from ~184s on.
+
+    Raises a retryable ChunkBudgetError when the tail is clearly more
+    noise-like than the head, or when the whole chunk is noise-like.
+    Silent frames are excluded so trailing pauses don't trigger it.
+    """
+    n_frames = len(audio) // sample_rate
+    if n_frames < 20:
+        return  # too short to be meaningful
+
+    window = np.hanning(sample_rate)
+    seconds = []
+    for i in range(n_frames):
+        seg = audio[i * sample_rate:(i + 1) * sample_rate]
+        rms = float(np.sqrt(np.mean(seg ** 2)))
+        if rms < 0.01:
+            continue  # silence: flatness is meaningless there
+        spec = np.abs(np.fft.rfft(seg * window))[1:] + 1e-12
+        flat = float(np.exp(np.mean(np.log(spec))) / np.mean(spec))
+        seconds.append((i, flat))
+
+    if len(seconds) < 10:
+        return  # mostly silence; nothing to check
+
+    flat = np.array([f for _, f in seconds])
+    idx = np.array([i for i, _ in seconds])
+    k = max(2, len(flat) // 5)
+    head = float(np.median(flat[:k]))
+    tail = float(np.median(flat[-k:]))
+    whole = float(np.median(flat))
+
+    if whole > 0.45:
+        raise ChunkBudgetError(
+            f"Audio quality degraded across the whole chunk (median spectral "
+            f"flatness {whole:.2f} is noise-like). Lower CHUNK_SIZE_WORDS so "
+            f"each generation stays short.",
+            deterministic=False,
+        )
+
+    if tail > 0.25 and tail > 2.0 * max(head, 0.05):
+        # Locate the approximate onset: first run of 3+ consecutive
+        # degraded seconds (clean speech never sustains flatness > 0.3).
+        onset = None
+        run_start = None
+        for i, f in zip(idx, flat):
+            if f > 0.3:
+                if run_start is None:
+                    run_start = int(i)
+                if int(i) - run_start >= 2 and onset is None:
+                    onset = run_start
+            else:
+                run_start = None
+        onset_txt = f" from ~{onset}s" if onset is not None else ""
+        raise ChunkBudgetError(
+            f"Audio quality degraded{onset_txt}: tail spectral flatness "
+            f"{tail:.2f} vs head {head:.2f}. Likely long-context drift; "
+            f"retrying with a fresh seed. If it persists, lower CHUNK_SIZE_WORDS.",
+            deterministic=False,
+        )
 
 
 # =============================================================================
@@ -160,10 +344,13 @@ class FasterQwenBackend:
                 model_id,
                 device=self.device,
                 dtype=self.dtype,
+                max_seq_len=FASTER_QWEN_MAX_SEQ_LEN,
             )
             self.sample_rate = self.model.sample_rate
             print(f"[OK] Model loaded successfully on {self.device}")
             print(f"[OK] Sample rate: {self.sample_rate} Hz")
+            print(f"[OK] Token budget: max_seq_len={FASTER_QWEN_MAX_SEQ_LEN} "
+                  f"(CHUNK_SIZE_WORDS={CHUNK_SIZE_WORDS})")
         except Exception as e:
             print(f"[ERROR] Failed to load model: {e}")
             print("Make sure you have:")
@@ -181,27 +368,31 @@ class FasterQwenBackend:
         if voice_mode == "voice_clone" and voice_clone_ref_text:
             self.voice_clone_ref_text = voice_clone_ref_text
 
-    def generate_custom_voice(self, text: str) -> np.ndarray:
+    def generate_custom_voice(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using CustomVoice mode with pre-built speaker"""
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
         result = self.model.generate_custom_voice(
             text=text,
             language=CUSTOM_VOICE_LANGUAGE,
             speaker=CUSTOM_VOICE_SPEAKER,
             instruct=CUSTOM_VOICE_INSTRUCT,
+            **gen_kwargs,
         )
         audio_list, sr = result[0] if isinstance(result, tuple) else (result, self.sample_rate)
         # Return first audio array and sample rate
         audio = audio_list[0] if isinstance(audio_list, list) else audio_list
         return audio
 
-    def generate_custom_voice_streaming(self, text: str) -> np.ndarray:
+    def generate_custom_voice_streaming(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using CustomVoice mode with streaming for faster TTFB"""
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
         result = self.model.generate_custom_voice_streaming(
             text=text,
             language=CUSTOM_VOICE_LANGUAGE,
             speaker=CUSTOM_VOICE_SPEAKER,
             instruct=CUSTOM_VOICE_INSTRUCT,
             chunk_size=STREAMING_CHUNK_SIZE,
+            **gen_kwargs,
         )
         # result is a generator yielding (audio_chunk, sr, timing) tuples
         all_chunks = []
@@ -214,10 +405,12 @@ class FasterQwenBackend:
         else:
             return np.concatenate(all_chunks)
 
-    def generate_voice_clone(self, text: str) -> np.ndarray:
+    def generate_voice_clone(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using Voice Clone mode with ICL or xvector"""
         if not self.voice_clone_ref_audio:
             raise ValueError("Reference audio not set for voice cloning")
+
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
 
         # ICL takes priority if ref_text is available on the backend
         if self.voice_clone_ref_text:
@@ -228,6 +421,7 @@ class FasterQwenBackend:
                 ref_text=self.voice_clone_ref_text,
                 xvec_only=False,
                 append_silence=VOICE_CLONE_APPEND_SILENCE,
+                **gen_kwargs,
             )
         elif VOICE_CLONE_USE_XVECTOR_ONLY or self.speaker_embedding is not None:
             if self.speaker_embedding is not None:
@@ -240,6 +434,7 @@ class FasterQwenBackend:
                     voice_clone_prompt={
                         "ref_spk_embedding": [self.speaker_embedding],
                     },
+                    **gen_kwargs,
                 )
             else:
                 result = self.model.generate_voice_clone(
@@ -248,6 +443,7 @@ class FasterQwenBackend:
                     ref_audio=self.voice_clone_ref_audio,
                     ref_text="",
                     xvec_only=True,
+                    **gen_kwargs,
                 )
         else:
             raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
@@ -256,12 +452,13 @@ class FasterQwenBackend:
         audio = audio_list[0] if isinstance(audio_list, list) else audio_list
         return audio
 
-    def generate_voice_clone_streaming(self, text: str) -> np.ndarray:
+    def generate_voice_clone_streaming(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using Voice Clone mode with streaming"""
         if not self.voice_clone_ref_audio:
             raise ValueError("Reference audio not set for voice cloning")
 
         non_streaming_mode = False  # Use step-by-step text feeding for streaming
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
 
         # ICL takes priority if ref_text is available on the backend
         if self.voice_clone_ref_text:
@@ -274,6 +471,7 @@ class FasterQwenBackend:
                 append_silence=VOICE_CLONE_APPEND_SILENCE,
                 chunk_size=STREAMING_CHUNK_SIZE,
                 non_streaming_mode=non_streaming_mode,
+                **gen_kwargs,
             )
         elif VOICE_CLONE_USE_XVECTOR_ONLY or self.speaker_embedding is not None:
             if self.speaker_embedding is not None:
@@ -286,6 +484,7 @@ class FasterQwenBackend:
                     voice_clone_prompt={"ref_spk_embedding": [self.speaker_embedding]},
                     chunk_size=STREAMING_CHUNK_SIZE,
                     non_streaming_mode=non_streaming_mode,
+                    **gen_kwargs,
                 )
             else:
                 result = self.model.generate_voice_clone_streaming(
@@ -296,6 +495,7 @@ class FasterQwenBackend:
                     xvec_only=True,
                     chunk_size=STREAMING_CHUNK_SIZE,
                     non_streaming_mode=non_streaming_mode,
+                    **gen_kwargs,
                 )
         else:
             raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
@@ -310,24 +510,28 @@ class FasterQwenBackend:
         else:
             return np.concatenate(all_chunks)
 
-    def generate_voice_design(self, text: str) -> np.ndarray:
+    def generate_voice_design(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using VoiceDesign mode (instruction-based)"""
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
         result = self.model.generate_voice_design(
             text=text,
             language=VOICE_DESIGN_LANGUAGE,
             instruct=VOICE_DESIGN_DESCRIPTION,
+            **gen_kwargs,
         )
         audio_list, sr = result[0] if isinstance(result, tuple) else (result, self.sample_rate)
         audio = audio_list[0] if isinstance(audio_list, list) else audio_list
         return audio
 
-    def generate_voice_design_streaming(self, text: str) -> np.ndarray:
+    def generate_voice_design_streaming(self, text: str, max_new_tokens: Optional[int] = None) -> np.ndarray:
         """Generate audio using VoiceDesign mode with streaming"""
+        gen_kwargs = {"max_new_tokens": max_new_tokens} if max_new_tokens is not None else {}
         result = self.model.generate_voice_design_streaming(
             text=text,
             language=VOICE_DESIGN_LANGUAGE,
             instruct=VOICE_DESIGN_DESCRIPTION,
             chunk_size=STREAMING_CHUNK_SIZE,
+            **gen_kwargs,
         )
         all_chunks = []
         sr = self.sample_rate
@@ -457,11 +661,16 @@ class QwenAudiobookConverter:
                 sys.exit(1)
 
     def get_cache_path(self, text: str) -> Path:
-        """Get cache path for text chunk"""
+        """Get cache path for text chunk
+
+        The generation parameters are part of the key so that audio cached
+        under an older (too small) token budget is never replayed.
+        """
         content = (
             f"{text}_{self.voice_mode}_"
             f"{CUSTOM_VOICE_SPEAKER if self.voice_mode == 'custom_voice' else ''}_"
-            f"{Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ''}"
+            f"{Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ''}_"
+            f"v2_{FASTER_QWEN_MAX_SEQ_LEN}_{TTS_WORDS_PER_MIN}_{TTS_BUDGET_SAFETY_FACTOR}"
         )
         hash_obj = hashlib.md5(content.encode())
         return Path("cache/audio_chunks") / f"{hash_obj.hexdigest()}.wav"
@@ -477,14 +686,23 @@ class QwenAudiobookConverter:
                 self.logger.debug(f"Using cached audio for chunk {chunk_num}")
                 return str(output_path)
 
+            # Size the token budget so the chunk cannot be silently truncated
+            max_new_tokens, expected_sec = plan_chunk_generation(
+                text, FASTER_QWEN_MAX_SEQ_LEN, self.voice_mode
+            )
+            self.logger.info(
+                f"Chunk {chunk_num}: {len(text.split())} words, expected ~{expected_sec:.0f}s of speech, "
+                f"max_new_tokens={max_new_tokens} (max_seq_len={FASTER_QWEN_MAX_SEQ_LEN})"
+            )
+
             # Generate audio based on selected mode and settings
             start_time = time.time()
 
             if self.voice_mode == "custom_voice":
                 if STREAMING_ENABLED:
-                    audio = self.backend.generate_custom_voice_streaming(text)
+                    audio = self.backend.generate_custom_voice_streaming(text, max_new_tokens)
                 else:
-                    audio = self.backend.generate_custom_voice(text)
+                    audio = self.backend.generate_custom_voice(text, max_new_tokens)
             elif self.voice_mode == "voice_clone":
                 if not self.backend.voice_clone_ref_audio:
                     raise ValueError("Reference audio not set for voice cloning")
@@ -492,31 +710,39 @@ class QwenAudiobookConverter:
                 # ICL takes priority if ref_text is available on the backend
                 if self.backend.voice_clone_ref_text:
                     if STREAMING_ENABLED:
-                        audio = self.backend.generate_voice_clone_streaming(text)
+                        audio = self.backend.generate_voice_clone_streaming(text, max_new_tokens)
                     else:
-                        audio = self.backend.generate_voice_clone(text)
+                        audio = self.backend.generate_voice_clone(text, max_new_tokens)
                 elif VOICE_CLONE_USE_XVECTOR_ONLY or self.backend.speaker_embedding is not None:
                     # XVector mode - only use when no ref_text but xvector configured
                     if STREAMING_ENABLED:
-                        audio = self.backend.generate_voice_clone_streaming(text)
+                        audio = self.backend.generate_voice_clone_streaming(text, max_new_tokens)
                     else:
-                        audio = self.backend.generate_voice_clone(text)
+                        audio = self.backend.generate_voice_clone(text, max_new_tokens)
                 else:
                     raise ValueError("Voice clone requires either ref_text (ICL mode) or speaker embedding (xvector mode)")
             elif self.voice_mode == "voice_design":
                 if STREAMING_ENABLED:
-                    audio = self.backend.generate_voice_design_streaming(text)
+                    audio = self.backend.generate_voice_design_streaming(text, max_new_tokens)
                 else:
-                    audio = self.backend.generate_voice_design(text)
+                    audio = self.backend.generate_voice_design(text, max_new_tokens)
             else:
                 raise ValueError(f"Unknown voice mode: {self.voice_mode}")
 
             elapsed = time.time() - start_time
-            rtf = elapsed / (len(audio) / self.backend.sample_rate) if len(audio) > 0 else 0
+            actual_sec = len(audio) / self.backend.sample_rate if len(audio) > 0 else 0
+            rtf = elapsed / actual_sec if actual_sec > 0 else 0
             self.logger.info(
                 f"Chunk {chunk_num}: {elapsed:.1f}s, RTF: {rtf:.2f}, "
-                f"Audio length: {len(audio)/self.backend.sample_rate:.1f}s"
+                f"Audio length: {actual_sec:.1f}s (expected ~{expected_sec:.0f}s, "
+                f"{actual_sec / expected_sec:.0%} of estimate)"
             )
+
+            # Detect silent truncation before the chunk counts as a success
+            check_chunk_audio(actual_sec, max_new_tokens, expected_sec)
+
+            # Detect long-context quality degradation (garbled tail)
+            check_chunk_audio_quality(audio, self.backend.sample_rate)
 
             # Convert numpy array to WAV file in chunks folder
             output_path = Path("chunks") / f"chunk_{chunk_num:04d}.wav"
@@ -534,6 +760,10 @@ class QwenAudiobookConverter:
             self.logger.debug(f"Chunk {chunk_num} generated successfully")
             return str(output_path)
 
+        except ChunkBudgetError as e:
+            # Propagate so the retry logic can decide (deterministic errors fail fast)
+            self.logger.error(f"Chunk {chunk_num} budget/truncation error: {e}")
+            raise
         except Exception as e:
             self.logger.error(f"Backend chunk processing failed for chunk {chunk_num}: {e}")
             return None
@@ -553,6 +783,16 @@ class QwenAudiobookConverter:
                     return True
                 else:
                     self.logger.warning(f"Chunk {chunk_num} attempt {attempt + 1} failed")
+            except ChunkBudgetError as e:
+                self.logger.error(f"Chunk {chunk_num} attempt {attempt + 1}: {e}")
+                if e.deterministic:
+                    self.logger.error(
+                        f"Chunk {chunk_num} cannot succeed with the current settings "
+                        f"(CHUNK_SIZE_WORDS={CHUNK_SIZE_WORDS}, FASTER_QWEN_MAX_SEQ_LEN={FASTER_QWEN_MAX_SEQ_LEN}); "
+                        f"not retrying."
+                    )
+                    self.logger.error(f"Chunk {chunk_num} failed after {attempt + 1} attempt(s)")
+                    return False
             except Exception as e:
                 self.logger.warning(f"Chunk {chunk_num} attempt {attempt + 1} error: {e}")
 
@@ -879,8 +1119,9 @@ class QwenAudiobookConverter:
             avg_chunk_size = sum(chunk_sizes) / len(chunk_sizes) if chunk_sizes else 0
             self.logger.info(f"Split into {total_chunks} chunks (avg {avg_chunk_size:.0f} words per chunk)")
 
-            # Estimate time: on RTX 4090, expected ~15-30 seconds per 1200-word chunk
-            est_seconds_per_chunk = 20
+            # Estimate time from the measured RTF (~0.52-0.60 on the reference GPU)
+            # plus ~15s of prefill/overhead per chunk.
+            est_seconds_per_chunk = avg_chunk_size / TTS_WORDS_PER_MIN * 60.0 * 0.6 + 15
             est_time = total_chunks * est_seconds_per_chunk
             est_minutes = int(est_time // 60)
             est_secs = est_time % 60

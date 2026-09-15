@@ -35,6 +35,10 @@ from audiobook_converter import (
     STREAMING_ENABLED,
     STREAMING_CHUNK_SIZE,
     AUDIO_FORMAT,
+    FASTER_QWEN_MAX_SEQ_LEN,
+    plan_chunk_generation,
+    check_chunk_audio,
+    ChunkBudgetError,
 )
 
 # =============================================================================
@@ -73,8 +77,10 @@ def get_or_init_model(voice_mode: str) -> Tuple[Optional[FasterQwen3TTS], Option
             model_id,
             device="cuda",
             dtype=torch.bfloat16,
+            max_seq_len=FASTER_QWEN_MAX_SEQ_LEN,
         )
-        print(f"[OK] Model loaded successfully (sample rate: {_model_instance.sample_rate} Hz)")
+        print(f"[OK] Model loaded successfully (sample rate: {_model_instance.sample_rate} Hz, "
+              f"max_seq_len={FASTER_QWEN_MAX_SEQ_LEN})")
         return _model_instance, None
     except Exception as e:
         error_msg = f"Failed to load model: {str(e)}"
@@ -93,12 +99,18 @@ def generate_custom_voice_audio(text: str, speaker: str, language: str, instruct
         raise gr.Error(err)
     
     try:
+        max_new_tokens, expected_sec = plan_chunk_generation(text, FASTER_QWEN_MAX_SEQ_LEN, "custom_voice")
+    except ChunkBudgetError as e:
+        raise gr.Error(str(e))
+    
+    try:
         result = model.generate_custom_voice_streaming(
             text=text,
             language=language,
             speaker=speaker,
             instruct=instruct,
             chunk_size=STREAMING_CHUNK_SIZE,
+            max_new_tokens=max_new_tokens,
         )
         
         all_chunks = []
@@ -112,7 +124,14 @@ def generate_custom_voice_audio(text: str, speaker: str, language: str, instruct
         else:
             audio = np.concatenate(all_chunks)
         
+        try:
+            check_chunk_audio(len(audio) / sr, max_new_tokens, expected_sec)
+        except ChunkBudgetError as e:
+            raise gr.Error(str(e))
+        
         return (sr, audio)
+    except gr.Error:
+        raise
     except Exception as e:
         raise gr.Error(f"Generation failed: {str(e)}")
 
@@ -125,6 +144,11 @@ def voice_clone_from_file(reference_audio: Optional[str], reference_text: str, t
     model, err = get_or_init_model("voice_clone")
     if err:
         raise gr.Error(err)
+    
+    try:
+        max_new_tokens, expected_sec = plan_chunk_generation(text, FASTER_QWEN_MAX_SEQ_LEN, "voice_clone")
+    except ChunkBudgetError as e:
+        raise gr.Error(str(e))
     
     try:
         ref_audio = reference_audio if reference_audio else _reference_audio_path
@@ -148,6 +172,7 @@ def voice_clone_from_file(reference_audio: Optional[str], reference_text: str, t
                 xvec_only=True,
                 voice_clone_prompt={"ref_spk_embedding": [_speaker_embedding]},
                 chunk_size=STREAMING_CHUNK_SIZE,
+                max_new_tokens=max_new_tokens,
             )
         elif use_xvec:
             result = model.generate_voice_clone_streaming(
@@ -157,6 +182,7 @@ def voice_clone_from_file(reference_audio: Optional[str], reference_text: str, t
                 ref_text="",
                 xvec_only=True,
                 chunk_size=STREAMING_CHUNK_SIZE,
+                max_new_tokens=max_new_tokens,
             )
         else:
             if not ref_text:
@@ -169,6 +195,7 @@ def voice_clone_from_file(reference_audio: Optional[str], reference_text: str, t
                 xvec_only=False,
                 append_silence=True,
                 chunk_size=STREAMING_CHUNK_SIZE,
+                max_new_tokens=max_new_tokens,
             )
         
         # Extract speaker embedding if xvector mode for future reuse
@@ -194,6 +221,11 @@ def voice_clone_from_file(reference_audio: Optional[str], reference_text: str, t
         else:
             audio = np.concatenate(all_chunks)
         
+        try:
+            check_chunk_audio(len(audio) / sr, max_new_tokens, expected_sec)
+        except ChunkBudgetError as e:
+            raise gr.Error(str(e))
+        
         return (sr, audio)
     except gr.Error:
         raise
@@ -210,11 +242,17 @@ def voice_design_audio(text: str, description: str, language: str) -> Tuple[int,
         raise gr.Error(err)
     
     try:
+        max_new_tokens, expected_sec = plan_chunk_generation(text, FASTER_QWEN_MAX_SEQ_LEN, "voice_design")
+    except ChunkBudgetError as e:
+        raise gr.Error(str(e))
+    
+    try:
         result = model.generate_voice_design_streaming(
             text=text,
             language=language,
             instruct=description,
             chunk_size=STREAMING_CHUNK_SIZE,
+            max_new_tokens=max_new_tokens,
         )
         
         all_chunks = []
@@ -228,7 +266,14 @@ def voice_design_audio(text: str, description: str, language: str) -> Tuple[int,
         else:
             audio = np.concatenate(all_chunks)
         
+        try:
+            check_chunk_audio(len(audio) / sr, max_new_tokens, expected_sec)
+        except ChunkBudgetError as e:
+            raise gr.Error(str(e))
+        
         return (sr, audio)
+    except gr.Error:
+        raise
     except Exception as e:
         raise gr.Error(f"Generation failed: {str(e)}")
 

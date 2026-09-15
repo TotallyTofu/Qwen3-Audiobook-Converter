@@ -15,9 +15,10 @@ Convert PDFs, EPUBs, DOCX, DOC, and TXT files into high-quality audiobooks using
   - **Voice Design**: Describe your desired voice tone and style using natural language
 - 📚 **Multi-Format Support**: TXT, PDF, EPUB, DOCX, DOC
 - 🤖 **1.7B Model Quality**: Uses the highest quality 1.7B model throughout
-- 🔄 **Smart Chunking**: Intelligent text splitting with sentence boundary detection
+- 🔄 **Smart Chunking**: Intelligent text splitting with sentence boundary detection, sized to stay inside the model's quality zone
+- 🛡️ **Truncation & Quality Detection**: Per-chunk token budget planning, silent-truncation detection, and a spectral guard against long-context garble
 - 💾 **Intelligent Caching**: Avoids re-processing identical chunks
-- 🔁 **Robust Error Handling**: Automatic retries and graceful failure recovery
+- 🔁 **Robust Error Handling**: Automatic retries with fresh seeds and graceful failure recovery
 - 📊 **Progress Tracking**: Real-time conversion progress with RTF metrics
 - ⚡ **Streaming Support**: Configurable streaming for lower time-to-first-audio
 
@@ -26,15 +27,15 @@ Convert PDFs, EPUBs, DOCX, DOC, and TXT files into high-quality audiobooks using
 🎧 **Sample Output**  
 <figure>
   <figcaption>Listen to the T-Rex:</figcaption>
-  <audio controls src="https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter/blob/main/sample/test_audio.mp3"></audio>
-  <a href="https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter/blob/main/sample/test_audio.mp3"> Download audio </a>
+  <audio controls src="https://github.com/TotallyTofu/Qwen3-Audiobook-Converter/blob/main/sample/test_audio.mp3"></audio>
+  <a href="https://github.com/TotallyTofu/Qwen3-Audiobook-Converter/blob/main/sample/test_audio.mp3"> Download audio </a>
 </figure>
 
 No it's not broken, it's a raw mp3 file download it and play it, you can't embedded audio in a readme.md GitHub whenthe sample is on GitHub
 
 ## 🧠 Performance Benchmarks (1.7B Model)
 
-**RTF > 1.0 means faster than real-time.** On an RTX 4090, a 1200-word chunk (~1 minute audio) takes ~30 seconds to generate.
+**RTF > 1.0 means faster than real-time.** On an RTX 4090, a 150-word chunk (~40s of audio) takes ~17 seconds to generate (RTF ~0.46).
 
 ## 🚀 Quick Start
 
@@ -48,7 +49,7 @@ No it's not broken, it's a raw mp3 file download it and play it, you can't embed
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter.git
+   git clone https://github.com/TotallyTofu/Qwen3-Audiobook-Converter.git
    cd Qwen3-Audiobook-Converter
    ```
 
@@ -122,7 +123,7 @@ All settings can be configured in `config.py` or by editing the hardcoded values
 |---------|---------|-------------|
 | `CUSTOM_VOICE_SPEAKER` | Ryan | Speaker name (Ryan, Serena, Aiden, Dylan, Eric, etc.) |
 | `CUSTOM_VOICE_LANGUAGE` | English | Target language |
-| `CHUNK_SIZE_WORDS` | 1200 | Words per processing chunk |
+| `CHUNK_SIZE_WORDS` | 150 | Words per processing chunk (see Chunk Sizing below) |
 | `STREAMING_ENABLED` | True | Use streaming for faster time-to-first-audio |
 | `DEVICE` | cuda | Compute device (cuda, cpu) |
 | `AUDIO_FORMAT` | mp3 | Output format |
@@ -185,12 +186,66 @@ VOICE_DESIGN_DESCRIPTION = "Warm, confident narrator with slight British accent 
 
 | Setting | Value | Description |
 |---------|-------|-------------|
-| `CHUNK_SIZE_WORDS` | 1200 | Words per processing chunk |
+| `CHUNK_SIZE_WORDS` | 150 | Words per processing chunk (quality-limited, see Chunk Sizing below) |
 | `MAX_WORKERS` | 1 | Concurrent chunks (keep at 1 to avoid GPU memory issues) |
 | `AUDIO_FORMAT` | mp3 | Output format |
 | `AUDIO_BITRATE` | 128k | Audio quality |
 | `MAX_RETRIES` | 3 | Retry attempts for failed chunks |
 | `STREAMING_CHUNK_SIZE` | 8 | Steps per audio chunk (smallest = faster start, larger = better throughput) |
+
+### Chunk Sizing (Token Budget + Quality)
+
+Chunk size is constrained by **three** independent limits:
+
+**1. Token budget.** faster-qwen3-tts caps each generation at
+`FASTER_QWEN_MAX_SEQ_LEN` **total** tokens (prompt + audio). The codec produces
+12 audio tokens per second. If the cap is too small the tail of the chunk is
+**silently dropped** — the audiobook then has missing paragraphs with no error
+in the log. The converter sizes each chunk's token budget automatically and
+fails loudly instead of truncating, but the two settings must stay matched:
+
+| `CHUNK_SIZE_WORDS` | Required `FASTER_QWEN_MAX_SEQ_LEN` | Notes |
+|--------------------|-------------------------------------|-------|
+| 150 | 4096 | **Default.** ~106s of audio at the 85 wpm budgeting rate |
+| 200 | 4096 | Aggressive: ~141s; near the quality boundary |
+| 300 | 8192 | Not recommended: ~212s, beyond the safe zone |
+
+Each +4096 of `FASTER_QWEN_MAX_SEQ_LEN` costs ~0.7 GB of VRAM. If a chunk's
+budget cannot fit, the log shows the exact required value, e.g.:
+
+```
+Chunk would be truncated: ~1000 words need ~10165 audio tokens ..., but only
+6391 fit in max_seq_len=8192 ... Raise FASTER_QWEN_MAX_SEQ_LEN to >= 11966
+or lower CHUNK_SIZE_WORDS.
+```
+
+**2. Long-context quality.** The talker is trained on short utterances and
+degrades to noise-like (garbled) audio when a single generation runs too long:
+garble onset was observed at ~184s in a 483.8s single generation, and the
+per-step text hints run out after ~83s. **Keep each generation well under
+~2 minutes of audio** — this is why the default is 150 words, not 700. As a
+safety net, a spectral-flatness guard (`check_chunk_audio_quality`) detects
+degraded audio after generation and retries the chunk with a fresh seed.
+
+**3. Short-chunk pacing.** The model narrates short chunks *faster* than long
+ones: 700-word chunks measure ~87 wpm, while 150-word chunks measure
+~160–236 wpm (the audio is complete and clean — only the pace differs). The
+post-generation "too short" check is therefore calibrated with
+`TTS_TOO_SHORT_RATIO` (0.30): audio shorter than 30% of the 85-wpm-based
+estimate is flagged as premature EOS (retryable). Complete 150-word audio
+measures 0.34–0.53 of the estimate, so a 0.40 floor makes good chunks fail
+randomly. Note the budgeting rate (`TTS_WORDS_PER_MIN = 85`) is deliberately
+the *slow* end of the observed range: an over-generous token cap is safe, an
+under-sized one truncates.
+
+Related settings (see `config.py`): `TTS_WORDS_PER_MIN` (narration rate used
+for budgeting, calibrated to 85), `TTS_CODEC_TOKENS_PER_SEC` (12),
+`TTS_BUDGET_SAFETY_FACTOR` (1.2), `TTS_MIN_MAX_NEW_TOKENS` (256),
+`TTS_VOICE_CLONE_REF_MARGIN` (512), `TTS_TOO_SHORT_RATIO` (0.30).
+
+> **Note:** If you change `FASTER_QWEN_MAX_SEQ_LEN` or the TTS budget settings,
+> old entries in `cache/audio_chunks/` are ignored automatically (the cache key
+> includes the generation parameters). You can also delete that folder.
 
 ## 📖 Supported File Formats
 
@@ -251,11 +306,15 @@ Or edit the hardcoded values at the top of `audiobook_converter.py`.
 ## 📁 Project Structure
 
 ```
-qwen-audiobook-converter/
+Qwen3-Audiobook-Converter/
 ├── audiobook_converter.py    # Main conversion script
+├── app.py                    # Gradio web UI
 ├── config.py                 # Configuration file
+├── test_chunk_budget.py      # Offline tests for budget/quality checks (no GPU needed)
+├── inspect_chunks.py         # Offline tool: dump a chunk's text by number (no GPU needed)
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
+├── QUICKSTART.md             # Quick start guide
 ├── LICENSE                   # MIT License
 ├── book_to_convert/          # 📚 Input folder (place books here)
 ├── audiobooks/               # 🎧 Output folder (audiobooks saved here)
@@ -269,13 +328,14 @@ qwen-audiobook-converter/
 ## 🔍 How It Works
 
 1. **Text Extraction**: Extracts text from various document formats (PDF, EPUB, DOCX, etc.)
-2. **Intelligent Chunking**: Splits text into optimal chunks (~1200 words) while respecting sentence boundaries
+2. **Intelligent Chunking**: Splits text into ~150-word chunks while respecting sentence boundaries — short enough to stay inside the talker's quality zone (see Chunk Sizing below)
 3. **CUDA Graph Optimization**: Uses static KV cache and CUDA graph capture for 5-10x speedup
 4. **Voice Generation**: Generates audio locally using faster-qwen3-tts with the 1.7B model
 5. **Streaming (Optional)**: Configurable streaming for lower time-to-first-audio latency
-6. **Progress Tracking**: Monitors chunk processing with RTF metrics in real-time
-7. **Audio Assembly**: Combines processed chunks into final audiobook via pydub
-8. **Cleanup**: Automatically removes temporary files, even on failure
+6. **Per-Chunk Verification**: After each generation, checks for token-cap hits, premature EOS ("too short" audio), and spectral degradation (garbled tails); retries with a fresh seed when needed
+7. **Progress Tracking**: Monitors chunk processing with RTF metrics in real-time
+8. **Audio Assembly**: Combines processed chunks into final audiobook via pydub
+9. **Cleanup**: Automatically removes temporary files, even on failure
 
 ### Faster-qwen3-tts vs Baseline Pipeline
 
@@ -287,6 +347,22 @@ Baseline (Qwen3-TTS original):
 Faster-qwen3-tts:
   Text → Tokenize → Static KV Cache + CUDAGraph → Replay Single Operation → Audio
   Entire decode step fused into single GPU operation = minimal overhead
+```
+
+## 🧪 Offline Tests (No GPU Required)
+
+The token-budget planning, truncation checks, and audio quality guard are
+covered by a fast, dependency-light test suite:
+
+```bash
+python test_chunk_budget.py
+```
+
+`inspect_chunks.py` is a small companion tool for diagnosing chunk content
+without loading the model:
+
+```bash
+python inspect_chunks.py 52 163 164   # print the exact text of chunks 52, 163, 164
 ```
 
 ## 🛠️ Troubleshooting
@@ -365,6 +441,53 @@ For MP3 output:
 # macOS: brew install ffmpeg
 ```
 
+### Chunk Fails: "Generation hit the token cap"
+
+```
+Chunk 42: Generation hit the token cap: 4083 tokens = max_new_tokens.
+The tail of the text was silently truncated.
+```
+
+**Cause**: the model narrated slower than the 85 wpm budgeting rate, so the
+chunk's audio exceeded its token budget.
+
+**Solutions**:
+- Raise `FASTER_QWEN_MAX_SEQ_LEN` (e.g. 4096 → 8192; costs ~0.7 GB VRAM)
+- Lower `CHUNK_SIZE_WORDS` (e.g. 150 → 100)
+- This is *deterministic* — retries with the same seed will hit the same cap,
+  so fix the budget rather than re-running
+
+### Chunk Fails: "Audio is far shorter than expected"
+
+```
+Chunk 52: Audio is far shorter than expected: 34.6s for ~89s of speech
+(floor 30%). Likely premature EOS; retrying.
+```
+
+**Cause**: the model stopped speaking before finishing the text (early EOS).
+Note that *complete* 150-word audio legitimately measures 0.34–0.53 of the
+85-wpm-based estimate (the model paces short chunks at ~2x the budgeting rate),
+so `TTS_TOO_SHORT_RATIO` is set to 0.30 — raising it makes good chunks fail
+randomly. If many chunks fail this check even at 0.30, your speaker/instruct
+is likely causing early stops: lower `CHUNK_SIZE_WORDS` (e.g. to 100) or try a
+different `CUSTOM_VOICE_SPEAKER`.
+
+### Chunk Fails: "Audio quality degraded"
+
+```
+Chunk 7: Audio quality degraded from ~187s: tail spectral flatness 0.62
+(whole 0.11). Possible long-context drift; retrying.
+```
+
+**Cause**: long-context drift — the talker degrades to noise-like audio when a
+single generation runs too long (onset observed at ~184s).
+
+**Solutions**:
+- Lower `CHUNK_SIZE_WORDS` (the default 150 keeps generations well under the
+  onset; the 150-word default produced no quality failures in full-book runs)
+- Lower `FASTER_QWEN_MAX_SEQ_LEN` so the cap trips *before* the quality onset
+  (a deterministic cap-hit is preferable to garbled audio)
+
 ## 🔧 Advanced Usage
 
 ### Speaker Embedding Reuse
@@ -410,7 +533,7 @@ Logs are saved to `logs/audiobook_YYYYMMDD.log` with detailed information about:
 
 | Metric | Value |
 |--------|-------|
-| Processing Speed (RTX 4090) | ~30s per 1200-word chunk |
+| Processing Speed (RTX 4090) | ~17s per 150-word chunk (RTF ~0.46) |
 | Quality | High-quality audio suitable for audiobooks |
 | Memory Usage | ~6-8GB VRAM during inference |
 | Storage | ~1MB per minute of audio (128kbps MP3) |
@@ -430,8 +553,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ```bash
 # Clone your fork
-git clone https://github.com/WhiskeyCoder/qwen-audiobook-converter.git
-cd qwen-audiobook-converter
+git clone https://github.com/TotallyTofu/Qwen3-Audiobook-Converter.git
+cd Qwen3-Audiobook-Converter
 
 # Install dependencies
 pip install -r requirements.txt
@@ -454,7 +577,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/WhiskeyCoder/Qwen3-Audiobook-Converter/issues)
+- **Issues**: [GitHub Issues](https://github.com/TotallyTofu/Qwen3-Audiobook-Converter/issues)
 - **Documentation**: See `config.py` for full configuration reference
 - **Questions**: Open a discussion on GitHub
 

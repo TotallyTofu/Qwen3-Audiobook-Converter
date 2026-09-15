@@ -6,20 +6,18 @@
 pip install -r requirements.txt
 ```
 
-**Important**: Also install FFmpeg separately:
+**Important**: Also install FFmpeg separately (required for MP3 output):
 - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
 - Linux: `sudo apt-get install ffmpeg`
 - Mac: `brew install ffmpeg`
 
-## Step 2: Start Qwen Voice Model
+You also need an **NVIDIA GPU with CUDA** (RTX 3060 or better recommended,
+minimum 6 GB VRAM). The 1.7B model (~4 GB) is downloaded automatically on the
+first run.
 
-1. Start your Qwen Gradio interface
-2. Ensure it's running on `http://127.0.0.1:7860` (default)
-3. Verify the API is accessible
+## Step 2: Configure the Converter
 
-## Step 3: Configure the Converter
-
-Edit the configuration section at the top of `audiobook_converter.py`:
+Edit `config.py`:
 
 ### For Custom Voice (Easiest - Recommended)
 
@@ -44,32 +42,39 @@ VOICE_MODE = "voice_design"
 VOICE_DESIGN_DESCRIPTION = "Speak in a clear, professional narrator voice."
 ```
 
-## Step 4: Add Your Books
+## Step 3: Add Your Books
 
-Place your books in the `books_to_convert/` folder:
+Place your books in the `book_to_convert/` folder:
 - Supported formats: `.txt`, `.pdf`, `.epub`, `.docx`, `.doc`
 
-## Step 5: Run the Converter
+## Step 4: Run the Converter
 
 ```bash
 python audiobook_converter.py
 ```
 
-## Step 6: Find Your Audiobook
+Prefer a browser? Launch the web UI instead:
+
+```bash
+python app.py
+```
+
+Then open `http://localhost:7861`.
+
+## Step 5: Find Your Audiobook
 
 Your completed audiobook will be in the `audiobooks/` folder!
 
 ## Troubleshooting
 
-**Can't connect to Qwen API?**
-- Make sure Qwen Gradio is running
-- Check the URL in configuration matches your Qwen server
-- Try: `curl http://127.0.0.1:7860/` to test connection
+**Out of GPU memory?**
+- Lower `CHUNK_SIZE_WORDS` (e.g. to 100) and/or `FASTER_QWEN_MAX_SEQ_LEN` (e.g. to 4096)
+- Close other GPU applications
 
 **FFmpeg not found?**
 - Install FFmpeg and add it to your system PATH
 - Restart your terminal after installation
 
 **Need help?**
-- See `README.md` for detailed documentation
-- Check `Qwen-API.md` for API details
+- See `README.md` for detailed documentation, including chunk sizing and
+  the per-chunk quality checks
