@@ -6,3 +6,10 @@ logs/
 cache/
 .env
 .kilo/
+
+# Input books are personal data — keep them out of the repo
+book_to_convert/*.epub
+book_to_convert/*.pdf
+book_to_convert/*.docx
+book_to_convert/*.doc
+book_to_convert/*.txt
