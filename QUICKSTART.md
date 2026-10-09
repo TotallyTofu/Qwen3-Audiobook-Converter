@@ -39,7 +39,7 @@ VOICE_CLONE_REF_TEXT = "The text spoken in the reference audio"
 
 ```python
 VOICE_MODE = "voice_design"
-VOICE_DESIGN_DESCRIPTION = "Speak in a clear, professional narrator voice."
+VOICE_DESIGN_DESCRIPTION = "A clear, calm, professional audiobook narrator reading at a slow, relaxed pace."
 ```
 
 ## Step 3: Add Your Books
@@ -74,6 +74,15 @@ Your completed audiobook will be in the `audiobooks/` folder!
 **FFmpeg not found?**
 - Install FFmpeg and add it to your system PATH
 - Restart your terminal after installation
+
+**Got `<book>.INCOMPLETE.mp3`?**
+- Some chunks failed even after retries; their text is in `audiobooks/<book>.MISSING.txt`
+- Run the converter again: finished chunks load from the cache, so only the missing ones are regenerated
+
+**Narration too fast or too slow?**
+- Custom voice / voice design: adjust the pace wording in `CUSTOM_VOICE_INSTRUCT` / `VOICE_DESIGN_DESCRIPTION`
+- Voice clone: the clone copies the reference clip's pace, so use a clip read slowly and calmly (the log shows "Reference clip pace")
+- The log prints each chunk's pace and a running median ("Narration pace: median ... wpm"); ~150 wpm is a typical audiobook pace
 
 **Need help?**
 - See `README.md` for detailed documentation, including chunk sizing and

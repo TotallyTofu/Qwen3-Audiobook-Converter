@@ -12,6 +12,7 @@ import numpy as np
 from audiobook_converter import (
     ChunkBudgetError,
     estimate_prefill_tokens,
+    estimate_spoken_words,
     plan_chunk_generation,
     check_chunk_audio,
     check_chunk_audio_quality,
@@ -60,12 +61,12 @@ def main():
     print(f"FASTER_QWEN_MAX_SEQ_LEN = {max_seq_len}")
 
     # 1. Default chunk (150 words) fits in the default budget
-    #    (calibrated rate: 85 wpm -> 105.9s expected -> 1525 tokens with 1.2x safety)
+    #    (calibrated rate: 85 wpm -> 105.9s expected -> 1589 tokens at 12.5 tokens/s with 1.2x safety)
     mnt, expected = expect_no_error(
         lambda: plan_chunk_generation(make_text(150), max_seq_len, "custom_voice"),
         "150 words @ default max_seq_len",
     )
-    assert mnt == 1525, f"expected 1525, got {mnt}"
+    assert mnt == 1589, f"expected 1589, got {mnt}"
     assert abs(expected - 150 / 85 * 60) < 1e-9, f"unexpected expected value: {expected}"
     print(f"  OK: 150 words -> max_new_tokens={mnt}, expected ~{expected:.0f}s")
 
@@ -91,7 +92,7 @@ def main():
         lambda: plan_chunk_generation(make_text(300), 4096, "custom_voice"),
         "300 words @ 4096",
     )
-    assert mnt == 3050, f"expected 3050, got {mnt}"
+    assert mnt == 3177, f"expected 3177, got {mnt}"
     assert abs(expected - 300 / 85 * 60) < 1e-9, f"unexpected expected value: {expected}"
     print(f"  OK: 300 words @ 4096 -> max_new_tokens={mnt}")
 
@@ -121,14 +122,47 @@ def main():
     )
     print("  OK: empty text rejected")
 
+    # 7b. Numbers count as one spoken word per digit ("1923" = nineteen twenty-three)
+    assert estimate_spoken_words("In 1923 he wrote") == 7, estimate_spoken_words("In 1923 he wrote")
+    assert estimate_spoken_words("pp. 124-57") == 6
+    mnt_plain, exp_plain = plan_chunk_generation("In the year he wrote", max_seq_len, "custom_voice")
+    mnt_digits, exp_digits = plan_chunk_generation("In 1923 he wrote", max_seq_len, "custom_voice")
+    assert exp_digits > exp_plain, "a year must be expected to take longer than a short word"
+    print(f"  OK: spoken-length estimate counts digits ({exp_plain:.1f}s -> {exp_digits:.1f}s)")
+
     # 8. Post-generation checks (700-word chunk: 6048-token budget = 504s cap)
-    # Cap hit: a true truncation stops within ~1s of the 504s cap -> 502s flags
+    # Cap hit: generation ran into the 504s cap instead of emitting EOS. At
+    # real narration speed that means a runaway, so it is retryable.
     err = expect_budget_error(
         lambda: check_chunk_audio(502.0, 6048, 420.0),
         "cap hit",
+        deterministic=False,
     )
     assert "token cap" in str(err)
-    print(f"  OK: cap hit detected: {err}")
+    print(f"  OK: cap hit detected (retryable): {err}")
+
+    # Runaway that stopped on its own below the cap (2026-09-11, chunk 36:
+    # 140 words, 113.9s on attempt 1 vs 48.2s on the retry) -> retryable
+    mnt_140, expected_140 = plan_chunk_generation(make_text(140), max_seq_len, "custom_voice")
+    err = expect_budget_error(
+        lambda: check_chunk_audio(113.9, mnt_140, expected_140),
+        "runaway below cap",
+        deterministic=False,
+    )
+    assert "longer than expected" in str(err)
+    print(f"  OK: runaway below the cap flagged (retryable): {err}")
+    expect_no_error(lambda: check_chunk_audio(48.2, mnt_140, expected_140), "chunk 36 retry")
+    print("  OK: chunk 36's good retry (48.2s) passes")
+
+    # Slow but complete narration (the slowest observed body chunk, 136 wpm,
+    # and a deliberately slower 110 wpm) must not be flagged as runaway
+    expect_no_error(lambda: check_chunk_audio(150 / 136 * 60, 1589, 105.9), "136 wpm")
+    expect_no_error(lambda: check_chunk_audio(150 / 110 * 60, 1589, 105.9), "110 wpm")
+    print("  OK: slow narration (136 and 110 wpm) passes")
+
+    # Very short chunk (a heading): the absolute slack keeps it from being flagged
+    expect_no_error(lambda: check_chunk_audio(2.5, 256, 2 / 85 * 60), "short heading")
+    print("  OK: 2-word heading at 2.5s passes")
 
     # Regression (2026-09-11 incident): the model narrates 700 words in
     # 403.2s (~104 wpm) and emits EOS after the FULL text. That is 16.8s
@@ -157,14 +191,14 @@ def main():
     # 0.34-0.53 of the estimate. The old 0.40 floor dropped these good chunks
     # (13 of 177). The fastest complete chunk observed (ratio 0.34) must pass:
     expect_no_error(
-        lambda: check_chunk_audio(36.0, 1525, 105.9),
+        lambda: check_chunk_audio(36.0, 1589, 105.9),
         "fast-but-complete 150-word chunk (ratio 0.34)",
     )
     print("  OK: fast-but-complete audio (36s vs 106s expected) passes")
 
     # The old threshold boundary (ratio 0.40) also passes now:
     expect_no_error(
-        lambda: check_chunk_audio(42.4, 1525, 105.9),
+        lambda: check_chunk_audio(42.4, 1589, 105.9),
         "old 0.40 boundary",
     )
     print("  OK: old 0.40 boundary (42.4s vs 106s expected) passes")
@@ -172,7 +206,7 @@ def main():
     # Catastrophic truncation (audio missing >70% of the text) is still
     # flagged as retryable:
     err = expect_budget_error(
-        lambda: check_chunk_audio(20.0, 1525, 105.9),
+        lambda: check_chunk_audio(20.0, 1589, 105.9),
         "catastrophic truncation",
         deterministic=False,
     )

@@ -95,9 +95,8 @@ python app.py --host 0.0.0.0 --port 7861
 ```
 
 Then open `http://localhost:7861` in your browser. The web UI provides:
-- **Text to Speech**: Quick voice generation with preview
 - **Book Converter**: Upload and convert book files
-- **Settings**: Tune streaming, chunk size, and view speaker info
+- **Settings**: View the conversion settings from `config.py` and speaker info
 
 ## 📋 System Requirements
 
@@ -123,8 +122,9 @@ All settings can be configured in `config.py` or by editing the hardcoded values
 |---------|---------|-------------|
 | `CUSTOM_VOICE_SPEAKER` | Ryan | Speaker name (Ryan, Serena, Aiden, Dylan, Eric, etc.) |
 | `CUSTOM_VOICE_LANGUAGE` | English | Target language |
+| `CUSTOM_VOICE_INSTRUCT` | calm, slow, relaxed narration | Style instruction; also sets the pace (without a pace cue the model reads at ~190 wpm) |
 | `CHUNK_SIZE_WORDS` | 150 | Words per processing chunk (see Chunk Sizing below) |
-| `STREAMING_ENABLED` | True | Use streaming for faster time-to-first-audio |
+| `STREAMING_ENABLED` | False | Streaming decode only lowers time-to-first-audio, which an offline converter doesn't use |
 | `DEVICE` | cuda | Compute device (cuda, cpu) |
 | `AUDIO_FORMAT` | mp3 | Output format |
 | `AUDIO_BITRATE` | 128k | Audio quality |
@@ -169,6 +169,14 @@ python audiobook_converter.py --voice-clone --voice-sample path/to/reference.wav
 
 > **Note:** XVector mode extracts a speaker embedding once and reuses it. It produces slightly lower quality but avoids needing the reference audio transcript. ICL mode requires `VOICE_CLONE_REF_TEXT` to be set in `config.py`.
 
+**Pace:** in ICL mode the clone continues on from the reference clip and picks
+up its pace, so for slower narration use a clip that is read slowly and calmly
+(~150 wpm is a typical audiobook pace). The log reports the clip's pace at
+startup ("Reference clip pace: ... wpm") and the narration's as it goes
+("Narration pace: median ... wpm"). Voice cloning takes no style instruction:
+on the Base model one doubled chunk-to-chunk voice variation while slowing the
+pace only ~4%.
+
 #### Voice Design Mode
 
 Describe the voice you want using natural language:
@@ -187,11 +195,17 @@ VOICE_DESIGN_DESCRIPTION = "Warm, confident narrator with slight British accent 
 | Setting | Value | Description |
 |---------|-------|-------------|
 | `CHUNK_SIZE_WORDS` | 150 | Words per processing chunk (quality-limited, see Chunk Sizing below) |
-| `MAX_WORKERS` | 1 | Concurrent chunks (keep at 1 to avoid GPU memory issues) |
-| `AUDIO_FORMAT` | mp3 | Output format |
+| `SENTENCE_PAUSE_MS` | 250 | Silence after a chunk that ends mid-paragraph |
+| `PARAGRAPH_PAUSE_MS` | 1000 | Silence after a chunk that ends a paragraph |
+| `CHAPTER_PAUSE_MS` | 2500 | Silence after a chunk that ends a chapter (EPUB document / text section) |
+| `AUDIO_FORMAT` | mp3 | Output format (mp3, m4a, wav) |
 | `AUDIO_BITRATE` | 128k | Audio quality |
-| `MAX_RETRIES` | 3 | Retry attempts for failed chunks |
-| `STREAMING_CHUNK_SIZE` | 8 | Steps per audio chunk (smallest = faster start, larger = better throughput) |
+| `MAX_RETRIES` | 3 | Retry attempts for failed chunks (hardcoded in `audiobook_converter.py`) |
+| `MAX_SPLIT_DEPTH` | 2 | A chunk that fails every retry is split in half and retried, up to this many times (hardcoded) |
+| `STREAMING_CHUNK_SIZE` | 8 | Steps per audio chunk when `STREAMING_ENABLED` is on |
+
+Chunks never cross a chapter boundary and prefer to end at a paragraph break,
+so the pauses above land where a narrator would pause.
 
 ### Chunk Sizing (Token Budget + Quality)
 
@@ -199,7 +213,7 @@ Chunk size is constrained by **three** independent limits:
 
 **1. Token budget.** faster-qwen3-tts caps each generation at
 `FASTER_QWEN_MAX_SEQ_LEN` **total** tokens (prompt + audio). The codec produces
-12 audio tokens per second. If the cap is too small the tail of the chunk is
+12.5 audio tokens per second (1920 samples at 24 kHz, despite the "12Hz" name). If the cap is too small the tail of the chunk is
 **silently dropped** — the audiobook then has missing paragraphs with no error
 in the log. The converter sizes each chunk's token budget automatically and
 fails loudly instead of truncating, but the two settings must stay matched:
@@ -238,14 +252,23 @@ randomly. Note the budgeting rate (`TTS_WORDS_PER_MIN = 85`) is deliberately
 the *slow* end of the observed range: an over-generous token cap is safe, an
 under-sized one truncates.
 
-Related settings (see `config.py`): `TTS_WORDS_PER_MIN` (narration rate used
-for budgeting, calibrated to 85), `TTS_CODEC_TOKENS_PER_SEC` (12),
-`TTS_BUDGET_SAFETY_FACTOR` (1.2), `TTS_MIN_MAX_NEW_TOKENS` (256),
-`TTS_VOICE_CLONE_REF_MARGIN` (512), `TTS_TOO_SHORT_RATIO` (0.30).
+**4. Runaway generations.** Sometimes the model fails to stop and keeps
+babbling. Audio longer than `TTS_TOO_LONG_RATIO` (1.0) x the 85-wpm estimate
+plus `TTS_TOO_LONG_SLACK_SEC` (3s), or audio that runs into the token cap, is
+retried. Numbers count as one spoken word per digit when estimating length,
+so bibliographies and dates aren't mistaken for runaways.
 
-> **Note:** If you change `FASTER_QWEN_MAX_SEQ_LEN` or the TTS budget settings,
-> old entries in `cache/audio_chunks/` are ignored automatically (the cache key
-> includes the generation parameters). You can also delete that folder.
+Related settings (see `config.py`): `TTS_WORDS_PER_MIN` (narration rate used
+for budgeting, calibrated to 85), `TTS_CODEC_TOKENS_PER_SEC` (12.5),
+`TTS_BUDGET_SAFETY_FACTOR` (1.2), `TTS_MIN_MAX_NEW_TOKENS` (256),
+`TTS_VOICE_CLONE_REF_MARGIN` (512), `TTS_TOO_SHORT_RATIO` (0.30),
+`TTS_TOO_LONG_RATIO` (1.0), `TTS_TOO_LONG_SLACK_SEC` (3.0).
+
+> **Note:** Generated chunks are cached in `cache/audio_chunks/`, keyed by the
+> chunk text and everything that affects the audio (voice, language, style
+> instruction, model, budget settings), so changing a setting never replays old
+> audio. An interrupted or incomplete conversion resumes from the cache; a
+> book's cache entries are deleted once its audiobook is complete.
 
 ## 📖 Supported File Formats
 
@@ -311,6 +334,7 @@ Qwen3-Audiobook-Converter/
 ├── app.py                    # Gradio web UI
 ├── config.py                 # Configuration file
 ├── test_chunk_budget.py      # Offline tests for budget/quality checks (no GPU needed)
+├── test_text_pipeline.py     # Offline tests for extraction, chunking, retries, combining (no GPU needed)
 ├── inspect_chunks.py         # Offline tool: dump a chunk's text by number (no GPU needed)
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
@@ -327,15 +351,15 @@ Qwen3-Audiobook-Converter/
 
 ## 🔍 How It Works
 
-1. **Text Extraction**: Extracts text from various document formats (PDF, EPUB, DOCX, etc.)
-2. **Intelligent Chunking**: Splits text into ~150-word chunks while respecting sentence boundaries — short enough to stay inside the talker's quality zone (see Chunk Sizing below)
+1. **Text Extraction**: Extracts text from various document formats (PDF, EPUB, DOCX, etc.), keeping paragraph and chapter breaks. EPUBs are read in spine (reading) order, one chapter per spine document
+2. **Intelligent Chunking**: Splits text into ~150-word chunks at sentence boundaries (including sentences ending inside quotes), never across a chapter, preferably at paragraph breaks — short enough to stay inside the talker's quality zone (see Chunk Sizing below)
 3. **CUDA Graph Optimization**: Uses static KV cache and CUDA graph capture for 5-10x speedup
 4. **Voice Generation**: Generates audio locally using faster-qwen3-tts with the 1.7B model
-5. **Streaming (Optional)**: Configurable streaming for lower time-to-first-audio latency
-6. **Per-Chunk Verification**: After each generation, checks for token-cap hits, premature EOS ("too short" audio), and spectral degradation (garbled tails); retries with a fresh seed when needed
+5. **Streaming (Optional)**: Off by default; streaming only lowers time-to-first-audio
+6. **Per-Chunk Verification**: After each generation, checks for token-cap hits and runaway (too long) audio, premature EOS ("too short" audio), and spectral degradation (garbled tails); retries with a fresh seed when needed, and splits a chunk that keeps failing into shorter pieces
 7. **Progress Tracking**: Monitors chunk processing with RTF metrics in real-time
-8. **Audio Assembly**: Combines processed chunks into final audiobook via pydub
-9. **Cleanup**: Automatically removes temporary files, even on failure
+8. **Audio Assembly**: Streams the chunks through ffmpeg into the final audiobook, inserting sentence, paragraph and chapter pauses
+9. **Cleanup and Resume**: Removes temporary files; the cache is kept until a book is complete, so re-running resumes an interrupted or incomplete conversion
 
 ### Faster-qwen3-tts vs Baseline Pipeline
 
@@ -356,6 +380,7 @@ covered by a fast, dependency-light test suite:
 
 ```bash
 python test_chunk_budget.py
+python test_text_pipeline.py   # extraction, chunking, split-on-failure, combining (needs ffmpeg for the last)
 ```
 
 `inspect_chunks.py` is a small companion tool for diagnosing chunk content
@@ -363,6 +388,7 @@ without loading the model:
 
 ```bash
 python inspect_chunks.py 52 163 164   # print the exact text of chunks 52, 163, 164
+python inspect_chunks.py --book "book_to_convert/My Book.epub" 1 2
 ```
 
 ## 🛠️ Troubleshooting
@@ -418,7 +444,7 @@ Error: Could not find model weights...
 On slower GPUs or without CUDA:
 - **Solution**: Ensure PyTorch is installed with CUDA support (`torch.cuda.is_available()` should return `True`)
 - CPU inference works but is significantly slower (~10-20x)
-- Adjust `STREAMING_CHUNK_SIZE` higher for better throughput at the cost of initial latency
+- Keep `STREAMING_ENABLED = False`: streaming re-decodes overlapping windows and gains nothing offline
 
 ### Out of GPU Memory
 
@@ -444,18 +470,39 @@ For MP3 output:
 ### Chunk Fails: "Generation hit the token cap"
 
 ```
-Chunk 42: Generation hit the token cap: 4083 tokens = max_new_tokens.
-The tail of the text was silently truncated.
+Chunk 42: Generation hit the token cap: 124.0s of audio at the 1589-token budget
+(~127s) for ~106s of speech. The model most likely failed to stop; retrying.
 ```
 
-**Cause**: the model narrated slower than the 85 wpm budgeting rate, so the
-chunk's audio exceeded its token budget.
+**Cause**: the budget allows ~2.5x the time the model actually needs (it
+narrates at ~150-250 wpm, the budget assumes 85 wpm x 1.2), so running into the
+cap almost always means the model failed to emit EOS and kept babbling. That is
+random, so the chunk is retried (and split into halves if it keeps failing).
 
-**Solutions**:
-- Raise `FASTER_QWEN_MAX_SEQ_LEN` (e.g. 4096 → 8192; costs ~0.7 GB VRAM)
+**Solutions** (only if it happens on *most* chunks, i.e. your voice really is
+that slow):
+- Lower `TTS_WORDS_PER_MIN` or raise `FASTER_QWEN_MAX_SEQ_LEN` (e.g. 4096 → 8192; costs ~0.7 GB VRAM)
 - Lower `CHUNK_SIZE_WORDS` (e.g. 150 → 100)
-- This is *deterministic* — retries with the same seed will hit the same cap,
-  so fix the budget rather than re-running
+
+### Chunk Fails: "Audio is far longer than expected"
+
+```
+Chunk 36: Audio is far longer than expected: 113.9s for ~99s of speech
+(limit 102s). Likely a runaway generation (babble or repetition); retrying.
+```
+
+**Cause**: a runaway generation that eventually stopped on its own. Retried
+automatically. If many chunks hit this with a slow speaker or style
+instruction, raise `TTS_TOO_LONG_RATIO` (e.g. 1.0 → 1.3).
+
+### Audiobook saved as `*.INCOMPLETE.mp3`
+
+When a chunk still fails after all retries and splits, the audiobook is saved
+as `<book>.INCOMPLETE.<ext>` and the missing text is listed in
+`audiobooks/<book>.MISSING.txt`. Run the converter again: every other chunk is
+loaded from the cache, so only the missing chunks are regenerated, and the
+final `<book>.<ext>` replaces the incomplete file. (Books whose final
+audiobook already exists are skipped; delete it to convert the book again.)
 
 ### Chunk Fails: "Audio is far shorter than expected"
 
@@ -485,8 +532,8 @@ single generation runs too long (onset observed at ~184s).
 **Solutions**:
 - Lower `CHUNK_SIZE_WORDS` (the default 150 keeps generations well under the
   onset; the 150-word default produced no quality failures in full-book runs)
-- Lower `FASTER_QWEN_MAX_SEQ_LEN` so the cap trips *before* the quality onset
-  (a deterministic cap-hit is preferable to garbled audio)
+- A chunk that keeps failing this check is split into shorter pieces
+  automatically; shorter generations stay inside the talker's quality zone
 
 ## 🔧 Advanced Usage
 
@@ -512,13 +559,14 @@ torch.load("speaker.pt", weights_only=True)  # Load when needed
 
 ### Adjusting Streaming Performance
 
-Trade-off between time-to-first-audio (TTFA) and throughput:
+Streaming is off by default for book conversion (it only helps interactive
+playback). When enabled, it trades time-to-first-audio (TTFA) for throughput:
 
 | `STREAMING_CHUNK_SIZE` | TTFA | RTF | Audio per Chunk |
 |------------------------|------|-----|-----------------|
-| 2 | ~250ms | 1.04x | 167ms |
-| 8 | ~550ms | 1.38x | 667ms |
-| 12 | ~750ms | 1.45x | 1000ms |
+| 2 | ~250ms | 1.04x | 160ms |
+| 8 | ~550ms | 1.38x | 640ms |
+| 12 | ~750ms | 1.45x | 960ms |
 | Non-streaming | N/A | 1.57x | All at once |
 
 ### Logging

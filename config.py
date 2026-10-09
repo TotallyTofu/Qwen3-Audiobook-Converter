@@ -11,15 +11,17 @@
 FASTER_QWEN_DEVICE = "cuda"          # torch device: cuda, cpu
 FASTER_QWEN_DTYPE = "bfloat16"       # torch dtype: bfloat16, float16
 
-# Streaming settings (enable for lower latency / faster first chunk)
-STREAMING_ENABLED = True
-STREAMING_CHUNK_SIZE = 8              # Decode steps per chunk (~667ms audio per chunk)
+# Streaming settings. Streaming only lowers time-to-first-audio, which an
+# offline converter never uses: each chunk is decoded in one pass when off.
+STREAMING_ENABLED = False
+STREAMING_CHUNK_SIZE = 8              # Decode steps per chunk (~640ms audio per chunk) when streaming
 
 # =============================================================================
 # TTS TOKEN BUDGET SETTINGS (chunk truncation prevention)
 # =============================================================================
 # faster-qwen3-tts limits each generation to `max_seq_len` TOTAL tokens
-# (prompt + audio). The codec produces 12 audio tokens per second.
+# (prompt + audio). The codec produces 12.5 audio tokens per second (1920
+# samples per token at 24 kHz, despite the "12Hz" model name).
 #
 # Narration rate (measured 2026-09-11, Ryan, Labyrinths): a full 700-word
 # chunk took 483.8s = 86.8 wpm. The previous 100 wpm calibration came from a
@@ -41,7 +43,7 @@ STREAMING_CHUNK_SIZE = 8              # Decode steps per chunk (~667ms audio per
 
 FASTER_QWEN_MAX_SEQ_LEN = 4096        # Total prompt+audio token budget per chunk
 TTS_WORDS_PER_MIN = 85                # Narration rate used for budgeting (measured: Ryan ~87 wpm on literary text)
-TTS_CODEC_TOKENS_PER_SEC = 12         # Codec frame rate (12 Hz models)
+TTS_CODEC_TOKENS_PER_SEC = 12.5       # Codec frame rate (measured: chunks are whole multiples of 1920 samples)
 TTS_BUDGET_SAFETY_FACTOR = 1.2        # Headroom over the estimated speech length
 TTS_MIN_MAX_NEW_TOKENS = 256          # Floor for the per-chunk audio token budget
 TTS_VOICE_CLONE_REF_MARGIN = 512      # Extra prompt estimate for voice-clone ICL (ref audio in context)
@@ -63,6 +65,15 @@ TTS_VOICE_CLONE_REF_MARGIN = 512      # Extra prompt estimate for voice-clone IC
 # failure modes.
 TTS_TOO_SHORT_RATIO = 0.30
 
+# "Too long" ceiling (runaway detection): audio longer than
+# TTS_TOO_LONG_RATIO x expected + TTS_TOO_LONG_SLACK_SEC is retried. The
+# expectation uses the slow 85 wpm budgeting rate, while real narration runs
+# ~150-250 wpm, so only generations that babble or repeat get this long
+# (2026-09-11: chunk 36 ran 113.9s on its first attempt, 48.2s on retry).
+# Numbers count as one word per digit when estimating length.
+TTS_TOO_LONG_RATIO = 1.0
+TTS_TOO_LONG_SLACK_SEC = 3.0
+
 # =============================================================================
 # VOICE GENERATION MODE
 # =============================================================================
@@ -78,7 +89,11 @@ VOICE_MODE = "custom_voice"
 
 CUSTOM_VOICE_SPEAKER = "Ryan"        # Options: Aiden, Dylan, Eric, Ono_anna, Ryan, Serena, Sohee, Uncle_fu, Vivian
 CUSTOM_VOICE_LANGUAGE = "English"    # Auto, Chinese, English, Japanese, Korean, French, German, Spanish, Portuguese, Russian
-CUSTOM_VOICE_INSTRUCT = "Speak naturally and clearly, as if reading a book."  # Style instruction (1.7B only)
+# Style instruction (1.7B only). Also controls pace: without a pace cue the
+# model narrates at ~190 wpm (median, Labyrinths), faster than the ~150-160
+# wpm of human audiobook narrators.
+CUSTOM_VOICE_INSTRUCT = ("Narrate like a professional audiobook reader: calm and clear, "
+                         "at a slow, relaxed pace, with natural pauses between sentences.")
 CUSTOM_VOICE_SEED = -1               # -1 for auto, or specific seed for consistency
 
 # =============================================================================
@@ -91,9 +106,14 @@ VOICE_CLONE_REF_AUDIO = ""           # Path to reference audio file (WAV format)
 VOICE_CLONE_REF_TEXT = ""            # Text matching what's spoken in the reference audio (required if VOICE_CLONE_USE_XVECTOR_ONLY=False)
 VOICE_CLONE_LANGUAGE = "Auto"
 VOICE_CLONE_USE_XVECTOR_ONLY = False  # True: lower quality but faster, no ref_text needed. False: ICL mode, requires ref_text, better quality
-VOICE_CLONE_MAX_CHUNK_CHARS = 200
-VOICE_CLONE_CHUNK_GAP = 0
 VOICE_CLONE_SEED = -1                # -1 for auto
+
+# Pace: voice cloning takes no style instruction (on the Base model one
+# doubled chunk-to-chunk voice variation while slowing the pace only ~4%).
+# In ICL mode the clone continues on from the reference clip and picks up
+# its pace, so for slower narration use a clip read slowly and calmly
+# (~150 wpm is a typical audiobook pace). The log reports the clip's pace
+# ("Reference clip pace") and the narration's ("Narration pace").
 VOICE_CLONE_APPEND_SILENCE = True     # Append 0.5s silence to reference audio (prevents phoneme bleed)
 
 # =============================================================================
@@ -103,7 +123,7 @@ VOICE_CLONE_APPEND_SILENCE = True     # Append 0.5s silence to reference audio (
 # Best for: Expressive narration, character voices with custom tone/emotion
 
 VOICE_DESIGN_LANGUAGE = "Auto"
-VOICE_DESIGN_DESCRIPTION = "Speak in a clear, professional narrator voice suitable for reading audiobooks."
+VOICE_DESIGN_DESCRIPTION = "A clear, calm, professional audiobook narrator reading at a slow, relaxed pace."
 VOICE_DESIGN_SEED = -1               # -1 for auto
 
 # =============================================================================
@@ -116,8 +136,15 @@ CHUNK_SIZE_WORDS = 150               # Words per chunk. Must stay short for QUAL
                                      # runs past ~3 min (onset observed at 184s in a 483.8s chunk).
                                      # 150 words ~= 106s of audio at 85 wpm (safe zone).
                                      # 200 words (~141s) is the aggressive upper bound.
-MAX_WORKERS = 1                      # Concurrent chunks (keep at 1 to avoid rate limiting)
-MIN_DELAY_BETWEEN_CHUNKS = 0.5       # Seconds delay between API calls
+                                     # Chunks never cross a chapter and prefer to end at a paragraph.
+
+# Silence added after each chunk in the final audiobook, by the boundary it
+# ends on. The model leaves only ~120 ms of its own silence at a chunk's end
+# (vs ~340 ms between sentences inside a chunk), so without these, sentences
+# ran together at chunk joins.
+SENTENCE_PAUSE_MS = 250              # Chunk ends mid-paragraph
+PARAGRAPH_PAUSE_MS = 1000            # Chunk ends at a paragraph break
+CHAPTER_PAUSE_MS = 2500              # Chunk ends a chapter (EPUB document / section)
 
 # =============================================================================
 # AUDIO OUTPUT SETTINGS
@@ -134,13 +161,12 @@ AUDIO_BITRATE = "128k"               # Audio quality: 64k, 128k, 192k, 256k, 320
 SUPPORTED_FORMATS = ['.txt', '.pdf', '.epub', '.docx', '.doc']
 
 # Text cleaning options
-CLEAN_PAGE_NUMBERS = True            # Remove standalone numbers
-NORMALIZE_WHITESPACE = True          # Clean up spacing
-SENTENCE_BOUNDARY_DETECTION = True   # Smart sentence splitting
+CLEAN_PAGE_NUMBERS = True            # TXT/PDF: drop lines that hold only a page number
 
 # Cache settings
-ENABLE_CACHING = True                # Cache processed chunks
-CACHE_CLEANUP_DAYS = 30              # Remove cache older than X days
+ENABLE_CACHING = True                # Cache generated chunks so an interrupted or incomplete
+                                     # conversion resumes where it stopped. A book's cache is
+                                     # deleted once its audiobook is complete.
 
 # Logging settings
 LOG_LEVEL = "INFO"                   # DEBUG, INFO, WARNING, ERROR

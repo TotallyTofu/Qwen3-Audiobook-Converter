@@ -1,15 +1,12 @@
 __pycache__/
 *.pyc
 chunks/
-audiobooks/
 logs/
 cache/
 .env
 .kilo/
 
-# Input books are personal data — keep them out of the repo
-book_to_convert/*.epub
-book_to_convert/*.pdf
-book_to_convert/*.docx
-book_to_convert/*.doc
-book_to_convert/*.txt
+# Input books and generated audiobooks are personal data and huge — keep
+# everything in both folders out of the repo (the converter creates them on first run)
+book_to_convert/
+audiobooks/
