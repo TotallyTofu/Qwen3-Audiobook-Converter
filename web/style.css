@@ -1,0 +1,414 @@
+/* =============================================================================
+   Audiobook Converter - web UI styles
+
+   Every colour is a token below, in one light set and one dark set. The theme
+   toggle (web/theme.js) puts a `dark` class on <body>; the dark set applies
+   when it is there. To re-colour the UI, change the tokens - nothing else.
+
+   Gradio re-writes custom CSS so every rule sits inside `.gradio-container`,
+   which is below <body>. A rule like `body.dark .thing` therefore never
+   matches. Anything that must differ between light and dark is a variable
+   set in the two token blocks (see --abc-sun and --abc-scheme), not a
+   `body.dark` selector.
+   ============================================================================= */
+
+body {
+  --abc-bg: #f6f4ef;
+  --abc-surface: #ffffff;
+  --abc-surface-2: #f3f1ec;        /* inputs, tracks, quiet panels */
+  --abc-border: #e5e1d8;
+  --abc-border-strong: #d1ccbf;
+  --abc-text: #1c1a17;
+  --abc-muted: #6a655a;
+  --abc-accent: #c2410c;
+  --abc-accent-hover: #9a3412;
+  --abc-accent-soft: #fdeee3;
+  --abc-on-accent: #ffffff;
+  --abc-ok: #15803d;      --abc-ok-soft: #e8f5ec;
+  --abc-warn: #a16207;    --abc-warn-soft: #fbf3dc;
+  --abc-err: #b91c1c;     --abc-err-soft: #fbeaea;
+  --abc-shadow: 0 1px 2px rgb(28 26 23 / 5%), 0 14px 32px -18px rgb(28 26 23 / 18%);
+  --abc-scheme: light;             /* native controls (the audio player) */
+  --abc-sun: none;                 /* theme toggle shows the icon of the theme you would switch to */
+  --abc-moon: block;
+}
+
+body.dark {
+  --abc-bg: #0e0d0c;
+  --abc-surface: #171513;
+  --abc-surface-2: #211e1b;
+  --abc-border: #2b2825;
+  --abc-border-strong: #403b35;
+  --abc-text: #f1eee8;
+  --abc-muted: #a39d91;
+  --abc-accent: #fb923c;
+  --abc-accent-hover: #fdba74;
+  --abc-accent-soft: #2b1a0c;
+  --abc-on-accent: #1a0e04;
+  --abc-ok: #4ade80;      --abc-ok-soft: #11271a;
+  --abc-warn: #facc15;    --abc-warn-soft: #2a2410;
+  --abc-err: #f87171;     --abc-err-soft: #2e1615;
+  --abc-shadow: none;
+  --abc-scheme: dark;
+  --abc-sun: block;
+  --abc-moon: none;
+}
+
+/* Paint the right background before Gradio has loaded (theme.js sets data-theme) */
+html { background: #f6f4ef; }
+html[data-theme="dark"] { background: #0e0d0c; color-scheme: dark; }
+
+/* -----------------------------------------------------------------------------
+   Map the tokens onto Gradio's own variables, so its built-in components
+   (inputs, dropdowns, buttons, upload zones) follow the theme.
+   ----------------------------------------------------------------------------- */
+body, body.dark {
+  --body-background-fill: var(--abc-bg);
+  --body-text-color: var(--abc-text);
+  --body-text-color-subdued: var(--abc-muted);
+  --background-fill-primary: var(--abc-surface);
+  --background-fill-secondary: var(--abc-surface-2);
+  --border-color-primary: var(--abc-border);
+  --border-color-accent: var(--abc-accent);
+  --color-accent: var(--abc-accent);
+  --color-accent-soft: var(--abc-accent-soft);
+  --link-text-color: var(--abc-accent);
+  --link-text-color-hover: var(--abc-accent-hover);
+  --link-text-color-active: var(--abc-accent-hover);
+  --link-text-color-visited: var(--abc-accent);
+
+  --block-background-fill: transparent;
+  --block-border-width: 0px;
+  --block-border-color: transparent;
+  --block-padding: 0px;
+  --block-shadow: none;
+  --block-radius: 14px;
+  --block-label-text-color: var(--abc-muted);
+  --block-label-background-fill: var(--abc-surface-2);
+  --block-label-border-color: var(--abc-border);
+  --block-title-text-color: var(--abc-text);
+  --block-title-text-weight: 560;
+  --block-title-text-size: 13.5px;
+  --block-title-background-fill: transparent;
+  --block-title-border-color: transparent;
+  --block-title-border-width: 0px;
+  --block-title-padding: 0px;
+  --block-title-radius: 0px;
+  --block-info-text-color: var(--abc-muted);
+  --block-info-text-size: 12.5px;
+  --layout-gap: 16px;
+
+  --input-background-fill: var(--abc-surface-2);
+  --input-background-fill-hover: var(--abc-surface-2);
+  --input-background-fill-focus: var(--abc-surface);
+  --input-border-width: 1px;
+  --input-border-color: var(--abc-border);
+  --input-border-color-hover: var(--abc-border-strong);
+  --input-border-color-focus: var(--abc-accent);
+  --input-radius: 12px;
+  --input-padding: 11px 14px;
+  --input-shadow: none;
+  --input-shadow-focus: 0 0 0 3px color-mix(in srgb, var(--abc-accent) 22%, transparent);
+  --input-text-size: 14.5px;
+  --input-placeholder-color: var(--abc-muted);
+
+  --button-primary-background-fill: var(--abc-accent);
+  --button-primary-background-fill-hover: var(--abc-accent-hover);
+  --button-primary-text-color: var(--abc-on-accent);
+  --button-primary-text-color-hover: var(--abc-on-accent);
+  --button-primary-border-color: transparent;
+  --button-primary-border-color-hover: transparent;
+  --button-secondary-background-fill: var(--abc-surface);
+  --button-secondary-background-fill-hover: var(--abc-surface-2);
+  --button-secondary-text-color: var(--abc-text);
+  --button-secondary-text-color-hover: var(--abc-text);
+  --button-secondary-border-color: var(--abc-border-strong);
+  --button-secondary-border-color-hover: var(--abc-border-strong);
+  --button-large-radius: 14px;
+  --button-large-padding: 14px 20px;
+  --button-large-text-size: 16px;
+  --button-large-text-weight: 600;
+  --button-transition: background-color 0.15s ease, border-color 0.15s ease;
+  --button-shadow: none;
+  --button-shadow-hover: none;
+  --button-shadow-active: none;
+
+  --shadow-drop: none;
+  --shadow-drop-lg: 0 12px 32px -8px rgb(0 0 0 / 28%);
+  --accordion-text-color: var(--abc-text);
+  --table-even-background-fill: transparent;
+  --table-odd-background-fill: var(--abc-surface-2);
+  --table-border-color: var(--abc-border);
+  --table-row-focus: var(--abc-accent-soft);
+}
+
+/* -----------------------------------------------------------------------------
+   Page
+   ----------------------------------------------------------------------------- */
+.gradio-container {
+  max-width: 1120px !important;
+  margin: 0 auto !important;
+  padding: 28px 24px 56px !important;
+  font-size: 15px;
+  background: transparent !important;
+}
+footer { display: none !important; }       /* "Use via API" / "Built with Gradio" */
+::selection { background: color-mix(in srgb, var(--abc-accent) 28%, transparent); }
+
+/* -----------------------------------------------------------------------------
+   Header
+   ----------------------------------------------------------------------------- */
+#app-header .app-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 0 2px 6px;
+}
+#app-header .brand { display: flex; align-items: center; gap: 14px; }
+#app-header .logo {
+  width: 46px; height: 46px; flex: none; border-radius: 14px;
+  display: grid; place-items: center;
+  background: var(--abc-accent); color: var(--abc-on-accent);
+}
+#app-header h1 {
+  margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.2;
+  color: var(--abc-text);
+}
+#app-header p { margin: 3px 0 0; font-size: 13.5px; color: var(--abc-muted); }
+
+#app-header .icon-btn {
+  width: 42px; height: 42px; flex: none; border-radius: 12px; padding: 0;
+  display: grid; place-items: center; cursor: pointer;
+  background: var(--abc-surface); color: var(--abc-text);
+  border: 1px solid var(--abc-border); box-shadow: var(--abc-shadow);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+#app-header .icon-btn:hover { border-color: var(--abc-border-strong); background: var(--abc-surface-2); }
+#app-header .icon-btn:focus-visible { outline: 2px solid var(--abc-accent); outline-offset: 2px; }
+#app-header .icon-sun { display: var(--abc-sun); }
+#app-header .icon-moon { display: var(--abc-moon); }
+
+/* -----------------------------------------------------------------------------
+   Layout and cards
+   ----------------------------------------------------------------------------- */
+#layout { gap: 20px; align-items: flex-start; margin-top: 14px; }
+#setup, #run { min-width: min(340px, 100%) !important; gap: 20px; }
+#run { position: sticky; top: 24px; }
+
+#layout .card {
+  gap: 16px;
+  padding: 24px;
+  background: var(--abc-surface);
+  border: 1px solid var(--abc-border);
+  border-radius: 20px;
+  box-shadow: var(--abc-shadow);
+}
+
+#layout .step { display: flex; align-items: center; gap: 12px; }
+#layout .step .num {
+  width: 28px; height: 28px; flex: none; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--abc-accent-soft); color: var(--abc-accent);
+  font-size: 13px; font-weight: 700;
+}
+#layout .step h2 {
+  margin: 0; font-size: 17px; font-weight: 640; letter-spacing: -0.01em; line-height: 1.25;
+  color: var(--abc-text);
+}
+#layout .step p { margin: 2px 0 0; font-size: 13px; color: var(--abc-muted); }
+#layout .hint { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--abc-muted); }
+
+#layout .pair { gap: 14px; }
+#layout .panel { gap: 16px; }
+/* Gradio wraps stacked inputs in .form, which paints a 1px seam (the border colour) between them */
+#layout .form, #settings .form { background: transparent !important; border: 0 !important; box-shadow: none !important; gap: 16px; }
+#layout .pair .form { gap: 14px; }
+input[role="listbox"] { padding-right: 40px; text-overflow: ellipsis; }
+
+/* -----------------------------------------------------------------------------
+   Upload zones (the book, and the voice sample for cloning)
+   Gradio sets the border style itself: dashed while empty, solid once filled.
+   ----------------------------------------------------------------------------- */
+#book-file, #voice-sample {
+  min-height: 0;
+  background: var(--abc-surface-2) !important;
+  border-width: 1.5px !important;
+  border-color: var(--abc-border-strong) !important;
+  border-radius: 16px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+#book-file:hover, #book-file:focus-within, #voice-sample:hover, #voice-sample:focus-within {
+  border-color: var(--abc-accent) !important;
+  background: var(--abc-accent-soft) !important;
+}
+#book-file button .wrap, #voice-sample button .wrap {
+  min-height: 150px;
+  font-size: 0;                      /* hides Gradio's fixed "Drop File Here - or - Click to Upload" */
+  gap: 8px;
+  color: var(--abc-accent);
+}
+#book-file button .wrap::after, #voice-sample button .wrap::after {
+  font-size: 15px; font-weight: 560; color: var(--abc-text);
+}
+#book-file button .wrap::after { content: "Drop a book here, or click to browse"; }
+#voice-sample button .wrap::after { content: "Drop a voice sample here, or click to browse"; }
+#book-file .icon-wrap, #voice-sample .icon-wrap { width: 34px; height: 34px; margin: 0; color: var(--abc-accent); }
+#book-file .or, #voice-sample .or { display: none; }
+
+/* A chosen book: a compact row instead of a big box */
+#book-file .file-preview-holder { overflow: visible; }
+#book-file .file-preview { display: block; margin: 0; font-size: 15px; color: var(--abc-text); }
+#book-file .file-preview tbody { display: block; }
+#book-file .file-preview tr {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 18px 56px 18px 18px;      /* room on the right for Gradio's clear (x) button */
+  background: transparent;
+}
+#book-file .file-preview td { display: block; width: auto; padding: 0; }
+#book-file .file-preview .filename { display: flex; min-width: 0; font-weight: 560; }  /* flex keeps "name" and ".ext" together */
+#book-file .file-preview .download a { color: var(--abc-muted); font-size: 13px; pointer-events: none; }
+
+/* -----------------------------------------------------------------------------
+   Voice type: segmented control
+   ----------------------------------------------------------------------------- */
+#voice-mode { background: transparent !important; border: 0 !important; }
+#voice-mode .wrap {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px;
+  background: var(--abc-surface-2);
+  border: 1px solid var(--abc-border);
+  border-radius: 14px;
+}
+#voice-mode label {
+  position: relative; justify-content: center; padding: 10px 8px;
+  background: transparent !important; border: 0 !important; border-radius: 10px;
+  box-shadow: none !important; cursor: pointer;
+  color: var(--abc-muted); font-weight: 560; font-size: 14.5px;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+#voice-mode label:hover { color: var(--abc-text); }
+#voice-mode label.selected {
+  background: var(--abc-surface) !important; color: var(--abc-text);
+  box-shadow: 0 0 0 1px var(--abc-border), 0 1px 3px rgb(0 0 0 / 10%) !important;
+}
+#voice-mode label:has(input:focus-visible) { outline: 2px solid var(--abc-accent); outline-offset: 1px; }
+#voice-mode input { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; }
+#voice-mode .ml-2 { margin-left: 0; }
+
+/* -----------------------------------------------------------------------------
+   Convert / Stop
+   ----------------------------------------------------------------------------- */
+#convert-btn, #stop-btn { width: 100%; }
+#convert-btn:disabled {               /* while a conversion runs: quiet, not a faded orange */
+  opacity: 1; cursor: not-allowed;
+  background: var(--abc-surface-2) !important; color: var(--abc-muted) !important;
+  border: 1px solid var(--abc-border);
+}
+#stop-btn {
+  --button-large-padding: 12px 20px;
+  background: transparent !important; color: var(--abc-text) !important;
+  border: 1.5px solid var(--abc-border-strong) !important;
+}
+#stop-btn:hover { background: var(--abc-surface-2) !important; }
+
+/* -----------------------------------------------------------------------------
+   Status panel: progress, result, messages
+   ----------------------------------------------------------------------------- */
+#status .idle { margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--abc-muted); }
+
+#status .status {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 16px 18px;
+  background: var(--abc-surface-2);
+  border: 1px solid var(--abc-border);
+  border-radius: 14px;
+}
+#status .status strong { font-size: 15px; font-weight: 640; color: var(--abc-text); }
+#status .status p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--abc-muted); }
+#status .status.done  { background: var(--abc-ok-soft);   border-color: color-mix(in srgb, var(--abc-ok) 35%, var(--abc-border)); }
+#status .status.warn  { background: var(--abc-warn-soft); border-color: color-mix(in srgb, var(--abc-warn) 35%, var(--abc-border)); }
+#status .status.error { background: var(--abc-err-soft);  border-color: color-mix(in srgb, var(--abc-err) 35%, var(--abc-border)); }
+#status .status.done strong  { color: var(--abc-ok); }
+#status .status.warn strong  { color: var(--abc-warn); }
+#status .status.error strong { color: var(--abc-err); }
+
+#status .status-top { display: flex; align-items: center; gap: 10px; }
+#status .pct { margin-left: auto; font-weight: 640; font-variant-numeric: tabular-nums; color: var(--abc-text); }
+
+/* The page redraws this panel every second, which restarts CSS animations.
+   The server sets a negative animation-delay (its clock modulo the 2s
+   period) on each animated element so the motion carries on unbroken. */
+#status .pulse {
+  width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--abc-accent);
+  animation: abc-pulse 2s ease-in-out infinite;
+}
+@keyframes abc-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+
+#status .bar { height: 8px; border-radius: 99px; background: var(--abc-border); overflow: hidden; }
+#status .bar span { display: block; height: 100%; border-radius: 99px; background: var(--abc-accent); }
+#status .bar.indeterminate span { width: 38%; animation: abc-slide 2s ease-in-out infinite; }
+@keyframes abc-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(270%); }
+}
+
+#status .meta {
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 12.5px; color: var(--abc-muted); font-variant-numeric: tabular-nums;
+}
+#status .what { font-size: 12.5px; word-break: break-word; }
+
+#status audio { width: 100%; height: 44px; margin-top: 2px; color-scheme: var(--abc-scheme); }
+#status .actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
+#status .btn-link {
+  flex: none; padding: 8px 16px; border-radius: 10px;
+  font-size: 14px; font-weight: 600; text-decoration: none;
+  background: var(--abc-surface); color: var(--abc-text);
+  border: 1px solid var(--abc-border-strong);
+}
+#status .btn-link:hover { background: var(--abc-surface-2); }
+#status .path {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12.5px; color: var(--abc-muted);
+}
+
+/* -----------------------------------------------------------------------------
+   Settings accordion
+   ----------------------------------------------------------------------------- */
+#settings {
+  margin-top: 20px; padding: 6px 24px;
+  background: var(--abc-surface) !important;
+  border: 1px solid var(--abc-border) !important;
+  border-radius: 20px; box-shadow: var(--abc-shadow);
+}
+#settings .label-wrap { padding: 14px 0; font-weight: 600; font-size: 15px; color: var(--abc-text); }
+#settings .hint { margin: 0 0 14px; }
+#settings .form { margin-bottom: 18px; }
+#settings code {
+  padding: 1px 6px; border-radius: 6px; font-size: 12.5px;
+  background: var(--abc-surface-2); color: var(--abc-text);
+}
+#settings .facts {
+  display: grid; grid-template-columns: minmax(180px, max-content) 1fr; gap: 10px 28px;
+  margin: 0 0 14px; font-size: 14px;
+}
+#settings .facts dt { color: var(--abc-muted); }
+#settings .facts dd { margin: 0; color: var(--abc-text); }
+
+/* -----------------------------------------------------------------------------
+   Small screens: one column, no sticky panel
+   ----------------------------------------------------------------------------- */
+@media (max-width: 760px) {
+  .gradio-container { padding: 18px 16px 40px !important; }
+  #run { position: static; }
+  #layout .card { padding: 18px; }
+  #voice-mode label { padding: 10px 2px; font-size: 13px; white-space: nowrap; }
+  #settings { padding: 4px 18px; }
+  #settings .facts { grid-template-columns: 1fr; gap: 2px; }
+  #settings .facts dd { margin-bottom: 10px; }
+  #app-header p { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #status .pulse, #status .bar.indeterminate span { animation: none; }
+}

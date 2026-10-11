@@ -22,7 +22,7 @@ import wave
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Callable, List, Optional, Dict, Any, Tuple
 from urllib.parse import unquote
 import time
 import sys
@@ -31,6 +31,11 @@ import xml.etree.ElementTree as ET
 from html import unescape
 import re
 from datetime import datetime
+
+# Number GPUs by PCI bus, as nvidia-smi does, so "cuda:N" names the same card
+# as nvidia-smi's GPU N. CUDA's default order is fastest-first. This must be
+# set before CUDA initializes.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # faster-qwen3-tts imports
 import numpy as np
@@ -93,7 +98,7 @@ MODEL_IDS = {
     "voice_clone": VOICE_CLONE_MODEL_ID,
     "voice_design": VOICE_DESIGN_MODEL_ID,
 }
-DEVICE = _cfg("FASTER_QWEN_DEVICE", "cuda")
+DEVICE = _cfg("FASTER_QWEN_DEVICE", "cuda:0")
 DTYPE = torch.bfloat16 if _cfg("FASTER_QWEN_DTYPE", "bfloat16") == "bfloat16" else torch.float16
 
 # Hardcoded Voice Settings (CustomVoice mode)
@@ -555,6 +560,13 @@ class FasterQwenBackend:
         model_id = MODEL_IDS[voice_mode]
 
         try:
+            device = torch.device(self.device)
+            if device.type == "cuda" and device.index is not None:
+                # Make the chosen GPU current: faster-qwen3-tts calls
+                # torch.cuda.synchronize() and other APIs that act on the
+                # current device, which is otherwise GPU 0.
+                torch.cuda.set_device(device)
+                print(f"[INFO] GPU {device.index}: {torch.cuda.get_device_name(device)}")
             self.model = FasterQwen3TTS.from_pretrained(
                 model_id,
                 device=self.device,
@@ -727,11 +739,18 @@ class FasterQwenBackend:
 class QwenAudiobookConverter:
     """Audiobook converter using faster-qwen3-tts backend"""
 
+    # Optional hooks for a front end (the web UI sets them; the CLI leaves them
+    # off). Class-level defaults, so instances built without __init__ work too.
+    progress_callback: Optional[Callable[[str, int, int], None]] = None  # (stage, done, total)
+    should_stop: Optional[Callable[[], bool]] = None  # polled between chunks
+
     def __init__(self, voice_mode: str = "custom_voice", voice_clone_ref_audio: Optional[str] = None,
                  voice_clone_ref_text: Optional[str] = None, force_xvector: bool = False,
                  speaker: Optional[str] = None, language: Optional[str] = None,
-                 instruct: Optional[str] = None, voice_description: Optional[str] = None):
+                 instruct: Optional[str] = None, voice_description: Optional[str] = None,
+                 device: Optional[str] = None):
         self.voice_mode = voice_mode
+        self.device = device or DEVICE
         self.voice_clone_ref_audio = voice_clone_ref_audio
         # Use passed ref_text first, then config.py fallback
         self.voice_clone_ref_text = voice_clone_ref_text if voice_clone_ref_text else ""
@@ -753,7 +772,7 @@ class QwenAudiobookConverter:
 
         # Initialize faster-qwen3-tts backend
         self.backend = FasterQwenBackend(
-            device=DEVICE, dtype=DTYPE, speaker=self.speaker, language=self.language,
+            device=self.device, dtype=DTYPE, speaker=self.speaker, language=self.language,
             instruct=self.instruct, voice_description=self.voice_description,
         )
         try:
@@ -1372,6 +1391,14 @@ class QwenAudiobookConverter:
             lines += [f"--- chunk {i} ---", chunks[i - 1].text, ""]
         report_path.write_text("\n".join(lines), encoding="utf-8")
 
+    def _report(self, stage: str, done: int = 0, total: int = 0) -> None:
+        """Tell the front end (if any) where the conversion is."""
+        if self.progress_callback:
+            try:
+                self.progress_callback(stage, done, total)
+            except Exception as e:  # a display problem must never abort a conversion
+                self.logger.warning(f"Progress callback failed: {e}")
+
     def convert_book(self, file_path: Path) -> bool:
         """Convert a single book to audiobook using faster-qwen3-tts.
 
@@ -1379,6 +1406,9 @@ class QwenAudiobookConverter:
         fail, the audiobook is still written, as <name>.INCOMPLETE.<ext>,
         next to a <name>.MISSING.txt report, and the cache is kept so the
         next run regenerates only the missing chunks.
+
+        If `should_stop` returns True between chunks, the run ends early
+        with nothing written (finished chunks stay cached) and returns False.
         """
         self.logger.info(f"Converting: {file_path.name}")
         start_time = time.time()
@@ -1388,6 +1418,7 @@ class QwenAudiobookConverter:
 
         try:
             # Extract text
+            self._report("reading")
             self.logger.info("Extracting text...")
             text = self.extract_text_from_file(file_path)
             if not text.strip():
@@ -1424,7 +1455,14 @@ class QwenAudiobookConverter:
             results = {}  # chunk_num -> success (bool)
 
             # Process chunks sequentially to ensure correct order and naming
+            self._report("generating", 0, total_chunks)
             for chunk_num, chunk in enumerate(chunks, 1):
+                if self.should_stop and self.should_stop():
+                    self.logger.info(f"Stopped on request before chunk {chunk_num}/{total_chunks}")
+                    print(f"[INFO] Stopped before chunk {chunk_num}/{total_chunks}"
+                          + ("; finished chunks stay cached." if ENABLE_CACHING else "."))
+                    self.cleanup_chunks()
+                    return False
                 try:
                     result = self.process_chunk(chunk_num, chunk.text)
                     results[chunk_num] = result
@@ -1441,6 +1479,7 @@ class QwenAudiobookConverter:
                     print(f"[ERROR] Chunk {chunk_num:3d}/{total_chunks} ERROR: {e}")
                     self.logger.error(f"- Chunk {chunk_num}/{total_chunks} error: {e}")
 
+                self._report("generating", chunk_num, total_chunks)
                 if chunk_num % 10 == 0:
                     self.log_pace()
 
@@ -1463,6 +1502,7 @@ class QwenAudiobookConverter:
             report_path = Path(AUDIOBOOKS_FOLDER) / f"{file_path.stem}.MISSING.txt"
             output_path = incomplete_path if missing else final_path
 
+            self._report("combining", total_chunks, total_chunks)
             success = self.combine_chunks(chunks, output_path, results)
             if not success:
                 self.logger.error("Failed to combine chunks into final audiobook")
@@ -1511,7 +1551,7 @@ class QwenAudiobookConverter:
         print(f"Output folder: {AUDIOBOOKS_FOLDER}")
         print(f"Voice mode: {self.voice_mode}")
         print(f"Model: {MODEL_IDS.get(self.voice_mode)}")
-        print(f"Device: {DEVICE}")
+        print(f"Device: {self.device}")
         if self.voice_mode == "custom_voice":
             print(f"Speaker: {self.speaker}")
             print(f"Language: {self.language}")

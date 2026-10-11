@@ -1,5 +1,5 @@
 """Offline tests for text extraction, chunking, the split-on-failure fallback,
-and combining chunks into the final audiobook.
+combining chunks into the final audiobook, and the web UI's progress/stop hooks.
 
 Run with:  python test_text_pipeline.py
 
@@ -310,6 +310,53 @@ def test_combine(conv):
     print(f"  OK: combined {duration:.2f}s = audio + pauses; missing chunk skipped; no .part left")
 
 
+def test_progress_and_stop():
+    """The web UI's hooks, on the real convert_book: a progress report per chunk,
+    and a stop request that ends the run without writing a partial audiobook."""
+    if shutil.which(ac.AudioSegment.converter) is None:
+        print("  SKIP: ffmpeg not found; progress/stop test not run")
+        return
+    conv = make_converter()  # a fresh one: this test sets voice attributes on it
+    conv.speaker, conv.language, conv.instruct = "Ryan", "English", "calm"
+    conv.backend = FakeBackend(max_ok_words=1000)
+
+    cwd = os.getcwd()
+    saved_format = ac.AUDIO_FORMAT
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        ac.AUDIO_FORMAT = "wav"
+        try:
+            for folder in ("chunks", "cache/audio_chunks", "audiobooks"):
+                Path(folder).mkdir(parents=True)
+            book = Path("book.txt")
+            # 3 chunks of 100 words. Plain words: the length estimate counts every digit as a word
+            book.write_text("\n\n".join(" ".join([w] * 100) + "." for w in ("alpha", "bravo", "charlie")),
+                            encoding="utf-8")
+
+            events = []
+            conv.progress_callback = lambda stage, done, total: events.append((stage, done, total))
+            assert conv.convert_book(book)
+            assert events[0][0] == "reading" and events[-1][0] == "combining", events
+            generating = [(done, total) for stage, done, total in events if stage == "generating"]
+            assert generating == [(0, 3), (1, 3), (2, 3), (3, 3)], generating
+            print("  OK: progress reports reading, each chunk (0..3 of 3), then combining")
+
+            # Stop once the first chunk is done: nothing is written, that chunk stays cached
+            Path("audiobooks", "book.wav").unlink()
+            events.clear()
+            conv.should_stop = lambda: any(stage == "generating" and done >= 1 for stage, done, _ in events)
+            assert not conv.convert_book(book)
+            assert conv.last_output_path is None and not list(Path("audiobooks").iterdir())
+            assert max(done for stage, done, _ in events if stage == "generating") == 1, events
+            assert all(stage != "combining" for stage, _, _ in events)
+            assert len(list(Path("cache/audio_chunks").glob("*.wav"))) == (1 if ac.ENABLE_CACHING else 0)
+            assert not list(Path("chunks").glob("chunk_*.wav")), "temporary chunk files are cleaned up"
+        finally:
+            ac.AUDIO_FORMAT = saved_format
+            os.chdir(cwd)
+    print("  OK: stop request ends the run after chunk 1 with no audiobook written; finished chunk stays cached")
+
+
 def main():
     conv = make_converter()
     test_html_extraction(conv)
@@ -320,6 +367,7 @@ def main():
     test_split_fallback(conv)
     test_voice_clone_reference(conv)
     test_combine(conv)
+    test_progress_and_stop()
     print("\nAll text pipeline tests passed.")
 
 

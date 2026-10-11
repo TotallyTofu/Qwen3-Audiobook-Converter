@@ -8,7 +8,9 @@
 # =============================================================================
 
 # faster-qwen3-tts settings
-FASTER_QWEN_DEVICE = "cuda"          # torch device: cuda, cpu
+FASTER_QWEN_DEVICE = "cuda:0"        # GPU to run on: cuda:<index>, numbered as in nvidia-smi
+                                     # (0 = RTX 5070 Ti, 1 = RTX 3060 on this machine). The web UI's
+                                     # Settings tab can pick a different GPU per conversion.
 FASTER_QWEN_DTYPE = "bfloat16"       # torch dtype: bfloat16, float16
 
 # Streaming settings. Streaming only lowers time-to-first-audio, which an

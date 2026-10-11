@@ -94,9 +94,17 @@ python app.py
 python app.py --host 0.0.0.0 --port 7861
 ```
 
-Then open `http://localhost:7861` in your browser. The web UI provides:
-- **Book Converter**: Upload and convert book files
-- **Settings**: View the conversion settings from `config.py` and speaker info
+Then open `http://localhost:7861` in your browser. It is one page with three steps:
+1. **Choose a book**: drop in a PDF, EPUB, DOCX or TXT file
+2. **Choose a voice**: a preset narrator, a clone of a voice sample, or a voice you describe in words
+3. **Convert**: shows live progress (chunks done, time elapsed, time left), a **Stop** button, and, when it finishes, a player and download link for the audiobook
+
+Other things to know:
+- **Light / dark**: the sun/moon button in the corner switches theme. The first visit follows your operating system's setting; after that the page remembers your choice.
+- **Close the tab any time.** The conversion runs on the server, so reopening the page picks up its progress (or shows the finished audiobook).
+- **Stop** ends the run after the current chunk. With caching on (the default in `config.py`), chunks already generated stay cached, so converting the same book with the same settings again carries on from there.
+- **Settings** (collapsed at the bottom) has the **Run conversions on** menu to pick the GPU for the next conversion, and lists the values read from `config.py`.
+- Finished audiobooks are served straight from the `audiobooks/` folder, so playing or downloading a large file does not copy it.
 
 ## 📋 System Requirements
 
@@ -125,7 +133,7 @@ All settings can be configured in `config.py` or by editing the hardcoded values
 | `CUSTOM_VOICE_INSTRUCT` | calm, slow, relaxed narration | Style instruction; also sets the pace (without a pace cue the model reads at ~190 wpm) |
 | `CHUNK_SIZE_WORDS` | 150 | Words per processing chunk (see Chunk Sizing below) |
 | `STREAMING_ENABLED` | False | Streaming decode only lowers time-to-first-audio, which an offline converter doesn't use |
-| `DEVICE` | cuda | Compute device (cuda, cpu) |
+| `FASTER_QWEN_DEVICE` | cuda:0 | GPU to run on, numbered as in `nvidia-smi` (the web UI's Settings section can pick another) |
 | `AUDIO_FORMAT` | mp3 | Output format |
 | `AUDIO_BITRATE` | 128k | Audio quality |
 
@@ -331,7 +339,10 @@ Or edit the hardcoded values at the top of `audiobook_converter.py`.
 ```
 Qwen3-Audiobook-Converter/
 ├── audiobook_converter.py    # Main conversion script
-├── app.py                    # Gradio web UI
+├── app.py                    # Gradio web UI (layout and the conversion job)
+├── web/
+│   ├── style.css             # Web UI look: colour tokens for light and dark, component styles
+│   └── theme.js              # Light / dark toggle
 ├── config.py                 # Configuration file
 ├── test_chunk_budget.py      # Offline tests for budget/quality checks (no GPU needed)
 ├── test_text_pipeline.py     # Offline tests for extraction, chunking, retries, combining (no GPU needed)
@@ -456,7 +467,7 @@ Error: CUDA out of memory
 - Close other GPU applications
 - Reduce `STREAMING_CHUNK_SIZE` to 4 or 2
 - Reduce `CHUNK_SIZE_WORDS` to process smaller chunks
-- Use `DEVICE="cpu"` as fallback (much slower)
+- On a multi-GPU machine, pick a GPU with more free memory (the web UI's Settings section, or `FASTER_QWEN_DEVICE` in config.py)
 
 ### FFmpeg Not Found
 

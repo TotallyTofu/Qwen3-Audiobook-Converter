@@ -56,7 +56,7 @@ python audiobook_converter.py
 Prefer a browser? Launch the web UI instead:
 
 ```bash
-python app.py
+python3.11 app.py
 ```
 
 Then open `http://localhost:7861`.
